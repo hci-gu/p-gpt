@@ -3,14 +3,18 @@
 
 
 
-## Setup
+## Installation & Setup
 
 
 ### Backend
 
-Navigate to `p-gpt/backend/` and run
+Navigate to `p-gpt/backend/` for non-cuda compatible device, run
 ``` bash
-uv sync
+uv sync --extra cpu
+```
+For CUDA compatible device, run
+``` bash
+uv sync --extra cuda
 ```
 
 To spin up the FastAPI server
