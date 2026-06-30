@@ -1,9 +1,12 @@
 lockfileVersion: 5.4
 
 specifiers:
+  '@ai-sdk/openai-compatible': ^3.0.2
+  '@ai-sdk/react': ^4.0.9
   '@fontsource-variable/roboto-slab': ^5.2.8
   '@radix-ui/react-use-controllable-state': ^1.2.3
   '@rive-app/react-webgl2': ^4.29.3
+  '@shadcn/react': ^0.2.0
   '@streamdown/cjk': ^1.0.3
   '@streamdown/code': ^1.1.1
   '@streamdown/math': ^1.0.2
@@ -41,9 +44,12 @@ specifiers:
   vite: ^8.1.0
 
 dependencies:
+  '@ai-sdk/openai-compatible': 3.0.2
+  '@ai-sdk/react': 4.0.9_react@19.2.7
   '@fontsource-variable/roboto-slab': 5.2.8
   '@radix-ui/react-use-controllable-state': 1.2.3_kwf2tca3obanmilsxe2rj5654e
   '@rive-app/react-webgl2': 4.29.3_react@19.2.7
+  '@shadcn/react': 0.2.0_kwf2tca3obanmilsxe2rj5654e
   '@streamdown/cjk': 1.0.3_react@19.2.7
   '@streamdown/code': 1.1.1_react@19.2.7
   '@streamdown/math': 1.0.2_react@19.2.7
@@ -95,6 +101,27 @@ packages:
       '@vercel/oidc': 3.2.0
     dev: false
 
+  /@ai-sdk/mcp/2.0.4:
+    resolution: {integrity: sha512-o5edIxgQrssKl/DABaXOzTUG/DUOyn25ilnnczQeLpnlSEUNXqYc3TSOZ7u6aBB+vkersQ7MXkfNMzqulR6CKw==}
+    engines: {node: '>=22'}
+    peerDependencies:
+      zod: ^3.25.76 || ^4.1.8
+    dependencies:
+      '@ai-sdk/provider': 4.0.1
+      '@ai-sdk/provider-utils': 5.0.2
+      pkce-challenge: 5.0.1
+    dev: false
+
+  /@ai-sdk/openai-compatible/3.0.2:
+    resolution: {integrity: sha512-C6qUMe+qSMn7HVr1a0v5H9BXYKhsT5uO4Q2VYVHYdT7johzx+d1gYgFMhkRIoheBpCl5NPhljR4I4sHMWWfz6w==}
+    engines: {node: '>=22'}
+    peerDependencies:
+      zod: ^3.25.76 || ^4.1.8
+    dependencies:
+      '@ai-sdk/provider': 4.0.1
+      '@ai-sdk/provider-utils': 5.0.2
+    dev: false
+
   /@ai-sdk/provider-utils/5.0.2:
     resolution: {integrity: sha512-EcmdjJb7yggsZPCbS3MFBpvAUnKaPW+QvanU5GzF00XCq0bqqAmvJ3MN19ejlmOETbW8sJNiq6qam48wTcbUNw==}
     engines: {node: '>=22'}
@@ -112,6 +139,23 @@ packages:
     engines: {node: '>=22'}
     dependencies:
       json-schema: 0.4.0
+    dev: false
+
+  /@ai-sdk/react/4.0.9_react@19.2.7:
+    resolution: {integrity: sha512-KJ/b9OOHgWHIwugupb+ARBlfh1dqBJhO1hEPzLmlp5R0yD9kARSO0JZxS7a9MFoFML/DytHbcFUUbIuUMAvmsA==}
+    engines: {node: '>=22'}
+    peerDependencies:
+      react: ^18 || ~19.0.1 || ~19.1.2 || ^19.2.1
+    dependencies:
+      '@ai-sdk/mcp': 2.0.4
+      '@ai-sdk/provider': 4.0.1
+      '@ai-sdk/provider-utils': 5.0.2
+      ai: 7.0.8
+      react: 19.2.7
+      swr: 2.4.2_react@19.2.7
+      throttleit: 2.1.0
+    transitivePeerDependencies:
+      - zod
     dev: false
 
   /@antfu/install-pkg/1.1.0:
@@ -2248,6 +2292,21 @@ packages:
 
   /@sec-ant/readable-stream/0.4.1:
     resolution: {integrity: sha512-831qok9r2t8AlxLko40y2ebgSDhenenCatLVeW/uBtnHPyhHOvG0C7TvfgecV+wHzIm5KUICgzmVpWS+IMEAeg==}
+    dev: false
+
+  /@shadcn/react/0.2.0_kwf2tca3obanmilsxe2rj5654e:
+    resolution: {integrity: sha512-g/LMtyL0eiHCHkOCelhYf32RC5nTMdtUNag1ZQRhSDCW+jnHxDY1Dajk7P6zJosOg8z2N4wzfKOY5sh54QTDYA==}
+    peerDependencies:
+      '@types/react': '>=19'
+      react: '>=19'
+    peerDependenciesMeta:
+      '@types/react':
+        optional: true
+      react:
+        optional: true
+    dependencies:
+      '@types/react': 19.2.17
+      react: 19.2.7
     dev: false
 
   /@shikijs/core/3.23.0:
@@ -6634,6 +6693,16 @@ packages:
     resolution: {integrity: sha512-5Z9ZpRzfuH6l/UAvCPAPUo3665Nk2wLaZU3x+TLHKVzIz33+sbJqbtrYoC3KD4/uVOr2Zp+L0LySezP9OHV9yA==}
     dev: false
 
+  /swr/2.4.2_react@19.2.7:
+    resolution: {integrity: sha512-ej644Y2bvkIajfR32KGeSSdBXQW+ScjGjkybZgSE7kFpk9eGnV44XY9FJylXi+W75pavSX1PVNB57W5EbhGIYw==}
+    peerDependencies:
+      react: ^16.11.0 || ^17.0.0 || ^18.0.0 || ^19.0.0
+    dependencies:
+      dequal: 2.0.3
+      react: 19.2.7
+      use-sync-external-store: 1.6.0_react@19.2.7
+    dev: false
+
   /systeminformation/5.31.11:
     resolution: {integrity: sha512-I6O7iaUj23AXRgCPDDnvi3xHvdOLp4+1YMbF+X194lJwY1NeWojgHJPhslVKcmTtrLTguRk3QJK+xEdTiI3P0w==}
     engines: {node: '>=8.0.0'}
@@ -6652,6 +6721,11 @@ packages:
   /tapable/2.3.3:
     resolution: {integrity: sha512-uxc/zpqFg6x7C8vOE7lh6Lbda8eEL9zmVm/PLeTPBRhh1xCgdWaQ+J1CUieGpIfm2HdtsUpRv+HshiasBMcc6A==}
     engines: {node: '>=6'}
+    dev: false
+
+  /throttleit/2.1.0:
+    resolution: {integrity: sha512-nt6AMGKW1p/70DF/hGBdJB57B8Tspmbp5gfJ8ilhLnt7kkr2ye7hzD6NVG8GGErk2HWF34igrL2CXmNIkzKqKw==}
+    engines: {node: '>=18'}
     dev: false
 
   /tiny-invariant/1.3.3:

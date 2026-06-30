@@ -20,11 +20,15 @@ const ICON_CENTER = 12;
 const ICON_STROKE_WIDTH = 2;
 
 type ModelId = string;
+type ExtendedLanguageModelUsage = LanguageModelUsage & {
+  cachedInputTokens?: number;
+  reasoningTokens?: number;
+};
 
 interface ContextSchema {
   usedTokens: number;
   maxTokens: number;
-  usage?: LanguageModelUsage;
+  usage?: ExtendedLanguageModelUsage;
   modelId?: ModelId;
 }
 

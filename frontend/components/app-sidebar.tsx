@@ -1,3 +1,4 @@
+import type { ComponentProps } from 'react'
 import {
   Sidebar,
   SidebarContent,
@@ -6,9 +7,9 @@ import {
   SidebarHeader,
 } from '@/components/ui/sidebar'
 
-export function AppSidebar() {
+export function AppSidebar(props: ComponentProps<typeof Sidebar>) {
   return (
-    <Sidebar>
+    <Sidebar {...props}>
       <SidebarHeader />
       <SidebarContent>
         <SidebarGroup />
