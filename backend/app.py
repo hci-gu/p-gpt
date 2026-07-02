@@ -5,16 +5,27 @@ from typing import Any, Literal
 
 import httpx
 from fastapi import FastAPI, HTTPException, Response
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 logger = logging.getLogger(__name__)
 
 REMOTE_HOST = "100.113.76.118"
 
 OLLAMA_BASE_URL = f"http://{REMOTE_HOST}:11434"
-OLLAMA_TEXT_MODEL = "google/gemma-4-E4B-it"
+OLLAMA_TEXT_MODEL = "gemma4:e4b"
 
 VLLM_BASE_URL = f"http://{REMOTE_HOST}:8000/v1"
 VLLM_TTS_MODEL = "mistralai/Voxtral-4B-TTS-2603"
@@ -256,6 +267,7 @@ async def stream_tts(request: StreamTTSRequest) -> StreamingResponse:
         request,
         timeout_seconds=request.text_generation_timeout_seconds,
     )
+    print(f"Text response: {text_response}")
     text_generation_seconds = perf_counter() - request_start
     generated_text = _extract_ollama_response_text(text_response)
     tts_payload = _build_tts_payload(generated_text, request)
