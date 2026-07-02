@@ -42,6 +42,7 @@ specifiers:
   typescript: ~6.0.2
   use-stick-to-bottom: ^1.1.6
   vite: ^8.1.0
+  zustand: ^5.0.14
 
 dependencies:
   '@ai-sdk/openai-compatible': 3.0.2
@@ -78,6 +79,7 @@ dependencies:
   tokenlens: 1.3.1
   tw-animate-css: 1.4.0
   use-stick-to-bottom: 1.1.6_react@19.2.7
+  zustand: 5.0.14_kwf2tca3obanmilsxe2rj5654e
 
 devDependencies:
   '@types/node': 24.13.2
@@ -7130,6 +7132,28 @@ packages:
       '@types/react': 19.2.17
       react: 19.2.7
       use-sync-external-store: 1.6.0_react@19.2.7
+    dev: false
+
+  /zustand/5.0.14_kwf2tca3obanmilsxe2rj5654e:
+    resolution: {integrity: sha512-/8tAspM5LMPr28b3fwLYrtdj77ECpfZviaP75CMTnwO8ISyaE4GDIG/9rDDYq/cH9D2Xw2A2RXglLInmVBQB/g==}
+    engines: {node: '>=12.20.0'}
+    peerDependencies:
+      '@types/react': '>=18.0.0'
+      immer: '>=9.0.6'
+      react: '>=18.0.0'
+      use-sync-external-store: '>=1.2.0'
+    peerDependenciesMeta:
+      '@types/react':
+        optional: true
+      immer:
+        optional: true
+      react:
+        optional: true
+      use-sync-external-store:
+        optional: true
+    dependencies:
+      '@types/react': 19.2.17
+      react: 19.2.7
     dev: false
 
   /zwitch/2.0.4:

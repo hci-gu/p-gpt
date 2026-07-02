@@ -46,8 +46,9 @@ class TextGenerationRequest(BaseModel):
     model: str = OLLAMA_TEXT_MODEL
     temperature: float = 1.0
     top_p: float = 0.95
-    max_tokens: int = 256
-    reasoning_effort: str = "none"
+    max_tokens: int = 1024
+    think: bool | Literal["low", "medium", "high", "max"] = False
+    reasoning_effort: Literal["none", "low", "medium", "high", "max"] | None = None
 
 
 class TTSRequest(BaseModel):
@@ -60,8 +61,9 @@ class TTSRequest(BaseModel):
 
 class StreamTTSRequest(TextGenerationRequest):
     tts_model: str = VLLM_TTS_MODEL
-    response_format: Literal["wav", "mp3", "opus", "aac", "flac"] = "wav"
+    response_format: Literal["wav", "mp3", "opus", "aac", "flac", "pcm"] = "wav"
     voice: str = "casual_male"
+    stream_audio: bool = True
     text_generation_timeout_seconds: float = Field(default=60, gt=0)
     tts_timeout_seconds: float = Field(default=120, gt=0)
     audio_chunk_size: int = Field(default=8192, gt=0)
@@ -72,11 +74,13 @@ class InitiateRequest(BaseModel):
     model: str = OLLAMA_TEXT_MODEL
     temperature: float = 1.0
     top_p: float = 0.95
-    max_tokens: int = 256
-    reasoning_effort: str = "none"
+    max_tokens: int = 1024
+    think: bool | Literal["low", "medium", "high", "max"] = False
+    reasoning_effort: Literal["none", "low", "medium", "high", "max"] | None = None
     tts_model: str = VLLM_TTS_MODEL
-    response_format: Literal["wav", "mp3", "opus", "aac", "flac"] = "wav"
+    response_format: Literal["wav", "mp3", "opus", "aac", "flac", "pcm"] = "wav"
     voice: str = "casual_male"
+    stream_audio: bool = True
     text_generation_timeout_seconds: float = Field(default=60, gt=0)
     tts_timeout_seconds: float = Field(default=120, gt=0)
     audio_chunk_size: int = Field(default=8192, gt=0)
@@ -98,6 +102,7 @@ def _content_type_for_audio_format(response_format: str) -> str:
         "flac": "audio/flac",
         "mp3": "audio/mpeg",
         "opus": "audio/ogg",
+        "pcm": "audio/pcm",
         "wav": "audio/wav",
     }
     return content_types.get(response_format, "application/octet-stream")
@@ -128,8 +133,9 @@ def _build_ollama_chat_payload(request: TextGenerationRequest) -> dict[str, Any]
         },
     }
 
-    if request.reasoning_effort:
-        payload["options"]["reasoning_effort"] = request.reasoning_effort
+    payload["think"] = request.think
+    if request.reasoning_effort and request.reasoning_effort != "none":
+        payload["think"] = request.reasoning_effort
 
     return payload
 
@@ -139,7 +145,7 @@ async def _generate_ollama_chat_response(
     timeout_seconds: float = 60,
 ) -> dict[str, Any]:
     payload = _build_ollama_chat_payload(request)
-
+    print(f"Sending request to Ollama: {payload}")
     try:
         async with httpx.AsyncClient(timeout=timeout_seconds) as client:
             response = await client.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload)
@@ -158,24 +164,41 @@ async def _generate_ollama_chat_response(
 def _extract_ollama_response_text(response_data: dict[str, Any]) -> str:
     message = response_data.get("message")
     if isinstance(message, dict) and isinstance(message.get("content"), str):
-        return message["content"]
+        content = message["content"].strip()
+        if content:
+            return content
 
     if isinstance(response_data.get("response"), str):
-        return response_data["response"]
+        response = response_data["response"].strip()
+        if response:
+            return response
 
-    raise HTTPException(
-        status_code=502,
-        detail="Ollama response did not contain generated text.",
-    )
+    done_reason = response_data.get("done_reason")
+    detail = "Ollama response did not contain generated text."
+    if done_reason == "length":
+        detail = "Ollama reached the generation token limit before producing final text."
+
+    raise HTTPException(status_code=502, detail=detail)
 
 
-def _build_tts_payload(generated_text: str, request: StreamTTSRequest) -> dict[str, str]:
-    return {
+def _build_tts_payload(generated_text: str, request: StreamTTSRequest) -> dict[str, str | bool]:
+    payload: dict[str, str | bool] = {
         "input": generated_text,
         "model": request.tts_model,
         "response_format": request.response_format,
         "voice": request.voice,
     }
+
+    # vLLM-Omni raw audio streaming is reliable for PCM. Some model/format
+    # combinations, including Voxtral WAV in our setup, close chunked responses
+    # mid-body when stream_format=audio is requested. Keep WAV browser-playable
+    # through the stable non-streaming upstream path until the frontend has a
+    # PCM/WebAudio player.
+    if request.stream_audio and request.response_format == "pcm":
+        payload["stream"] = True
+        payload["stream_format"] = "audio"
+
+    return payload
 
 
 def _stream_request_from_initiate_request(request: InitiateRequest) -> StreamTTSRequest:
@@ -185,10 +208,12 @@ def _stream_request_from_initiate_request(request: InitiateRequest) -> StreamTTS
         temperature=request.temperature,
         top_p=request.top_p,
         max_tokens=request.max_tokens,
+        think=request.think,
         reasoning_effort=request.reasoning_effort,
         tts_model=request.tts_model,
         response_format=request.response_format,
         voice=request.voice,
+        stream_audio=request.stream_audio,
         text_generation_timeout_seconds=request.text_generation_timeout_seconds,
         tts_timeout_seconds=request.tts_timeout_seconds,
         audio_chunk_size=request.audio_chunk_size,
@@ -232,11 +257,13 @@ async def _get_or_generate_text(
             raise HTTPException(status_code=502, detail=state.error)
 
         state.text_generation_started = True
+        print("Generating text for request_id=%s", request_id)
         try:
             text_response = await _generate_ollama_chat_response(
                 state.request,
                 timeout_seconds=state.request.text_generation_timeout_seconds,
             )
+            print(f"Text response for request_id={request_id}: {text_response}")
             state.generated_text = _extract_ollama_response_text(text_response)
         except HTTPException as exc:
             state.error = str(exc.detail)
@@ -361,6 +388,7 @@ async def initiate_request(request: InitiateRequest) -> dict[str, str]:
     Requests are held in memory, so they are lost if the backend process restarts.
     """
     request_id = str(uuid4())
+    print(f"Initiating request with ID: {request_id}, request: {request}")
     pending_requests[request_id] = RequestState(
         _stream_request_from_initiate_request(request)
     )
@@ -387,6 +415,7 @@ async def get_initiated_request_text(request_id: str) -> dict[str, Any]:
     if state is None:
         raise HTTPException(status_code=404, detail="Unknown request_id.")
 
+    print(f"Fetching text for request ID: {request_id}")
     generated_text = await _get_or_generate_text(request_id, state)
     return {"request_id": request_id, "generated_text": generated_text}
 
@@ -410,6 +439,8 @@ async def stream_initiated_request_audio(request_id: str) -> StreamingResponse:
     state = pending_requests.get(request_id)
     if state is None:
         raise HTTPException(status_code=404, detail="Unknown request_id.")
+    
+    print(f"Streaming audio for request ID: {request_id}")
 
     request = state.request
     generated_text = await _get_or_generate_text(
@@ -451,6 +482,7 @@ async def stream_initiated_request_audio(request_id: str) -> StreamingResponse:
         try:
             async for chunk in response.aiter_bytes(chunk_size=request.audio_chunk_size):
                 if chunk:
+                    print(f"Received audio chunk of size {len(chunk)} bytes for request ID: {request_id}")
                     now = perf_counter()
                     chunk_count += 1
                     total_bytes += len(chunk)
@@ -464,7 +496,16 @@ async def stream_initiated_request_audio(request_id: str) -> StreamingResponse:
                             request_id,
                         )
 
+                    print(f"Yielding audio chunk of size {len(chunk)} bytes for request ID: {request_id}")
                     yield chunk
+        except httpx.RemoteProtocolError:
+            logger.exception(
+                "upstream TTS stream ended with an incomplete chunked response: "
+                "request_id=%s chunks=%s bytes=%s",
+                request_id,
+                chunk_count,
+                total_bytes,
+            )
         finally:
             total_seconds = perf_counter() - request_start
             logger.info(
@@ -477,6 +518,7 @@ async def stream_initiated_request_audio(request_id: str) -> StreamingResponse:
                 first_chunk_seconds or -1,
             )
             await stream_context.__aexit__(None, None, None)
+            print(f"Closing HTTP client for request ID: {request_id}")
             await client.aclose()
 
     return StreamingResponse(
@@ -568,6 +610,12 @@ async def stream_tts(request: StreamTTSRequest) -> StreamingResponse:
                         )
 
                     yield chunk
+        except httpx.RemoteProtocolError:
+            logger.exception(
+                "upstream stream-tts response ended incomplete: chunks=%s bytes=%s",
+                chunk_count,
+                total_bytes,
+            )
         finally:
             total_seconds = perf_counter() - request_start
             logger.info(
