@@ -24,7 +24,6 @@ import {
   PromptInputActionMenuContent,
   PromptInputActionMenuTrigger,
   PromptInputBody,
-  PromptInputButton,
   PromptInputFooter,
   PromptInputHeader,
   PromptInputSubmit,
@@ -46,7 +45,6 @@ import { SpeechInput } from '@/components/ai-elements/speech-input'
 import type { TranscriptionEvent } from '@/components/ai-elements/speech-input'
 import { Suggestions } from '@/components/ai-elements/suggestion'
 import { Spinner } from '@/components/ui/spinner'
-import { GlobeIcon } from 'lucide-react'
 import type { ChangeEvent } from 'react'
 import { useCallback, useMemo, useRef, useState } from 'react'
 import { suggestions, useChatStore } from '../../state/chat'
@@ -74,7 +72,6 @@ const splitIntoRevealTokens = (content: string) =>
 
 const ChatPage = () => {
   const text = useChatStore((state) => state.text)
-  const useWebSearch = useChatStore((state) => state.useWebSearch)
   const status = useChatStore((state) => state.status)
   const messages = useChatStore((state) => state.messages)
   const setText = useChatStore((state) => state.setText)
@@ -87,7 +84,6 @@ const ChatPage = () => {
   const finishTranscriptionDraft = useChatStore(
     (state) => state.finishTranscriptionDraft
   )
-  const toggleWebSearch = useChatStore((state) => state.toggleWebSearch)
   const submitMessage = useChatStore((state) => state.submitMessage)
   const completeAssistantResponse = useChatStore(
     (state) => state.completeAssistantResponse
@@ -291,13 +287,19 @@ const ChatPage = () => {
           </Suggestions>
         )}
         <div className="w-full px-4 pb-4">
-          <PromptInput globalDrop multiple onSubmit={handleSubmit}>
+          <PromptInput
+            className="[&_[data-slot=input-group]]:bg-[hsl(0_0%_100%_/_var(--prompt-input-surface-opacity))] [&_[data-slot=input-group]]:backdrop-blur-md"
+            globalDrop
+            multiple
+            onSubmit={handleSubmit}
+          >
             <PromptInputHeader>
               <PromptInputAttachmentsDisplay />
             </PromptInputHeader>
             <PromptInputBody>
-              <div className="relative">
+              <div className="relative w-full">
                 <PromptInputTextarea
+                  className="min-h-24 content-start text-left align-top"
                   disabled={isTranscribing}
                   onChange={handleTextChange}
                   value={text}
@@ -328,13 +330,6 @@ const ChatPage = () => {
                   size="icon-sm"
                   variant="ghost"
                 />
-                <PromptInputButton
-                  onClick={toggleWebSearch}
-                  variant={useWebSearch ? 'default' : 'ghost'}
-                >
-                  <GlobeIcon size={16} />
-                  <span>Search</span>
-                </PromptInputButton>
               </PromptInputTools>
               <PromptInputSubmit
                 disabled={isSubmitDisabled}

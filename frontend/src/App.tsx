@@ -9,6 +9,7 @@ const backgroundTuning = {
   headerSurfaceOpacity: 0.72,
   imageOpacity: 0.86,
   overlayOpacity: 0.28,
+  promptInputSurfaceOpacity: 0.88,
 }
 
 const backgroundStyle = {
@@ -16,6 +17,7 @@ const backgroundStyle = {
   '--header-surface-opacity': backgroundTuning.headerSurfaceOpacity,
   '--image-opacity': backgroundTuning.imageOpacity,
   '--overlay-opacity': backgroundTuning.overlayOpacity,
+  '--prompt-input-surface-opacity': backgroundTuning.promptInputSurfaceOpacity,
 } as CSSProperties
 
 function App() {
