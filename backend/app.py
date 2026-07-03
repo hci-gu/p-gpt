@@ -24,6 +24,7 @@ app.add_middleware(
 )
 logger = logging.getLogger(__name__)
 pending_requests: dict[str, "RequestState"] = {}
+CANCELLED_REQUEST_DETAIL = "Request interrupted."
 
 REMOTE_HOST = "100.113.76.118"
 
@@ -89,11 +90,13 @@ class InitiateRequest(BaseModel):
 class RequestState:
     def __init__(self, request: StreamTTSRequest) -> None:
         self.request = request
+        self.cancelled = False
         self.generated_text: str | None = None
         self.error: str | None = None
         self.text_ready = asyncio.Event()
         self.text_generation_lock = asyncio.Lock()
         self.text_generation_started = False
+        self.text_generation_task: asyncio.Task[Any] | None = None
 
 
 def _content_type_for_audio_format(response_format: str) -> str:
@@ -225,11 +228,15 @@ async def _get_or_generate_text(
     state: RequestState,
     wait_timeout_seconds: float | None = None,
 ) -> str:
+    if state.cancelled:
+        raise HTTPException(status_code=499, detail=CANCELLED_REQUEST_DETAIL)
+
     if state.generated_text is not None:
         return state.generated_text
 
     if state.error is not None:
-        raise HTTPException(status_code=502, detail=state.error)
+        status_code = 499 if state.error == CANCELLED_REQUEST_DETAIL else 502
+        raise HTTPException(status_code=status_code, detail=state.error)
 
     if state.text_generation_lock.locked():
         try:
@@ -244,37 +251,80 @@ async def _get_or_generate_text(
             ) from exc
 
         if state.error is not None:
-            raise HTTPException(status_code=502, detail=state.error)
+            status_code = 499 if state.error == CANCELLED_REQUEST_DETAIL else 502
+            raise HTTPException(status_code=status_code, detail=state.error)
+        if state.cancelled:
+            raise HTTPException(status_code=499, detail=CANCELLED_REQUEST_DETAIL)
         if state.generated_text is None:
             raise HTTPException(status_code=502, detail="Text generation failed.")
         return state.generated_text
 
     async with state.text_generation_lock:
+        if state.cancelled:
+            raise HTTPException(status_code=499, detail=CANCELLED_REQUEST_DETAIL)
+
         if state.generated_text is not None:
             return state.generated_text
 
         if state.error is not None:
-            raise HTTPException(status_code=502, detail=state.error)
+            status_code = 499 if state.error == CANCELLED_REQUEST_DETAIL else 502
+            raise HTTPException(status_code=status_code, detail=state.error)
 
         state.text_generation_started = True
         print("Generating text for request_id=%s", request_id)
         try:
+            state.text_generation_task = asyncio.current_task()
             text_response = await _generate_ollama_chat_response(
                 state.request,
                 timeout_seconds=state.request.text_generation_timeout_seconds,
             )
+            if state.cancelled:
+                raise HTTPException(status_code=499, detail=CANCELLED_REQUEST_DETAIL)
             print(f"Text response for request_id={request_id}: {text_response}")
             state.generated_text = _extract_ollama_response_text(text_response)
+        except asyncio.CancelledError as exc:
+            state.cancelled = True
+            state.error = CANCELLED_REQUEST_DETAIL
+            raise HTTPException(
+                status_code=499,
+                detail=CANCELLED_REQUEST_DETAIL,
+            ) from exc
         except HTTPException as exc:
             state.error = str(exc.detail)
             raise
         finally:
+            state.text_generation_task = None
             state.text_ready.set()
 
     if state.generated_text is None:
         raise HTTPException(status_code=502, detail="Text generation failed.")
     logger.info("generated text for request_id=%s", request_id)
     return state.generated_text
+
+
+def _interrupt_request_state(request_id: str, state: RequestState) -> dict[str, str | bool]:
+    state.cancelled = True
+    state.error = CANCELLED_REQUEST_DETAIL
+    state.text_ready.set()
+
+    task = state.text_generation_task
+    task_cancelled = False
+    if task is not None and not task.done():
+        task.cancel()
+        task_cancelled = True
+
+    logger.info(
+        "interrupted request_id=%s text_generation_started=%s task_cancelled=%s",
+        request_id,
+        state.text_generation_started,
+        task_cancelled,
+    )
+
+    return {
+        "interrupted": True,
+        "request_id": request_id,
+        "text_generation_task_cancelled": task_cancelled,
+    }
 
 
 @app.get("/")
@@ -420,6 +470,16 @@ async def get_initiated_request_text(request_id: str) -> dict[str, Any]:
     return {"request_id": request_id, "generated_text": generated_text}
 
 
+@app.post("/requests/{request_id}/interrupt")
+async def interrupt_initiated_request(request_id: str) -> dict[str, str | bool]:
+    """Interrupt an initiated text/audio request if it is still running."""
+    state = pending_requests.get(request_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="Unknown request_id.")
+
+    return _interrupt_request_state(request_id, state)
+
+
 @app.get("/requests/{request_id}/audio")
 async def stream_initiated_request_audio(request_id: str) -> StreamingResponse:
     """Stream raw TTS audio bytes for an initiated request.
@@ -448,6 +508,9 @@ async def stream_initiated_request_audio(request_id: str) -> StreamingResponse:
         state,
         wait_timeout_seconds=30,
     )
+    if state.cancelled:
+        raise HTTPException(status_code=499, detail=CANCELLED_REQUEST_DETAIL)
+
     request_start = perf_counter()
     tts_payload = _build_tts_payload(generated_text, request)
 
@@ -481,6 +544,13 @@ async def stream_initiated_request_audio(request_id: str) -> StreamingResponse:
 
         try:
             async for chunk in response.aiter_bytes(chunk_size=request.audio_chunk_size):
+                if state.cancelled:
+                    logger.info(
+                        "initiated audio stream interrupted: request_id=%s",
+                        request_id,
+                    )
+                    break
+
                 if chunk:
                     print(f"Received audio chunk of size {len(chunk)} bytes for request ID: {request_id}")
                     now = perf_counter()
