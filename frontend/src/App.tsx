@@ -68,7 +68,7 @@ function App() {
           <AppSidebar className="!top-14 !bottom-auto !h-[calc(100svh-3.5rem)]" />
           <main className="mx-auto flex h-[calc(100vh-3.5rem)] w-full max-w-6xl flex-col px-4 py-6 sm:px-6 lg:px-8">
             <section
-              className="min-h-0 flex-1 overflow-hidden rounded-lg border shadow-sm backdrop-blur-sm"
+              className="chat-shell min-h-0 flex-1 overflow-hidden rounded-lg border shadow-sm backdrop-blur-sm"
               style={{
                 backgroundColor:
                   'hsl(0 0% 100% / var(--chat-surface-opacity))',

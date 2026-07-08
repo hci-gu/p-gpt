@@ -19,13 +19,8 @@ import {
 import type { PromptInputMessage } from '@/components/ai-elements/prompt-input'
 import {
   PromptInput,
-  PromptInputActionAddAttachments,
-  PromptInputActionMenu,
-  PromptInputActionMenuContent,
-  PromptInputActionMenuTrigger,
   PromptInputBody,
   PromptInputFooter,
-  PromptInputHeader,
   PromptInputSubmit,
   PromptInputTextarea,
   PromptInputTools,
@@ -45,13 +40,14 @@ import { SpeechInput } from '@/components/ai-elements/speech-input'
 import type { TranscriptionEvent } from '@/components/ai-elements/speech-input'
 import { Suggestions } from '@/components/ai-elements/suggestion'
 import { Spinner } from '@/components/ui/spinner'
+import { Switch } from '@/components/ui/switch'
 import type { ChangeEvent } from 'react'
 import { useCallback, useMemo, useRef, useState } from 'react'
+import defaultPersonProfileImageUrl from '../../../assets/default-person-pfp.png'
 import { suggestions, useChatStore } from '../../state/chat'
 import {
   AnimatedMessageResponse,
   AudioMessage,
-  PromptInputAttachmentsDisplay,
   SuggestionItem,
 } from './components'
 
@@ -69,6 +65,25 @@ const transcriptionRevealDurationMs = 900
 
 const splitIntoRevealTokens = (content: string) =>
   content.match(/\S+\s*/g) ?? (content ? [content] : [])
+
+const VoiceOnlyModeControl = ({
+  checked,
+  onCheckedChange,
+}: {
+  checked: boolean
+  onCheckedChange: (checked: boolean) => void
+}) => (
+  <label className="flex shrink-0 items-center gap-2 rounded-md px-2 py-1 text-muted-foreground text-xs">
+    <span>Voice only</span>
+    <Switch
+      aria-label="Voice only mode"
+      checked={checked}
+      className="data-checked:bg-green-500 dark:data-checked:bg-green-500"
+      onCheckedChange={onCheckedChange}
+      size="sm"
+    />
+  </label>
+)
 
 const ChatPage = () => {
   const text = useChatStore((state) => state.text)
@@ -95,6 +110,9 @@ const ChatPage = () => {
     (state) => state.interruptAssistantResponse
   )
   const [isTranscribing, setIsTranscribing] = useState(false)
+  const [isVoiceOnlyMode, setIsVoiceOnlyMode] = useState(false)
+  const [isAssistantAudioPlaying, setIsAssistantAudioPlaying] = useState(false)
+  const [assistantAudioLevel, setAssistantAudioLevel] = useState(0)
   const transcriptionAnimationRef = useRef<number | null>(null)
 
   const handleSubmit = useCallback(
@@ -121,6 +139,17 @@ const ChatPage = () => {
   const handleTranscriptionChange = useCallback(
     (event: TranscriptionEvent) => {
       if (!event.isFinal) {
+        return
+      }
+
+      if (isVoiceOnlyMode) {
+        const transcript = event.text.trim()
+
+        if (transcript) {
+          submitMessage(transcript)
+        }
+
+        setIsTranscribing(false)
         return
       }
 
@@ -163,7 +192,12 @@ const ChatPage = () => {
 
       transcriptionAnimationRef.current = requestAnimationFrame(tick)
     },
-    [finishTranscriptionDraft, updateTranscriptionDraft]
+    [
+      finishTranscriptionDraft,
+      isVoiceOnlyMode,
+      submitMessage,
+      updateTranscriptionDraft,
+    ]
   )
 
   const handleTranscriptionStart = useCallback(
@@ -173,9 +207,13 @@ const ChatPage = () => {
         transcriptionAnimationRef.current = null
       }
       setIsTranscribing(false)
+      if (isVoiceOnlyMode) {
+        setText('')
+        return
+      }
       beginTranscriptionDraft(sessionId)
     },
-    [beginTranscriptionDraft]
+    [beginTranscriptionDraft, isVoiceOnlyMode, setText]
   )
 
   const handleTranscriptionProcessingChange = useCallback(
@@ -192,16 +230,46 @@ const ChatPage = () => {
     [setText]
   )
 
+  const handleVoiceOnlyModeChange = useCallback(
+    (checked: boolean) => {
+      setIsVoiceOnlyMode(checked)
+      setIsAssistantAudioPlaying(false)
+      setAssistantAudioLevel(0)
+
+      if (checked) {
+        setText('')
+      }
+    },
+    [setText]
+  )
+
+  const handleAssistantAudioStart = useCallback(() => {
+    setIsAssistantAudioPlaying(true)
+  }, [])
+
+  const handleAssistantAudioLevelChange = useCallback((level: number) => {
+    setAssistantAudioLevel((currentLevel) =>
+      Math.abs(currentLevel - level) < 0.02 ? currentLevel : level
+    )
+  }, [])
+
   const isGenerating = status === 'submitted' || status === 'streaming'
   const isSubmitDisabled = useMemo(
     () => !isGenerating && (!text.trim() || isTranscribing),
     [isGenerating, isTranscribing, text]
   )
-  const shouldShowSuggestions = messages.length === 0
+  const shouldShowSuggestions = messages.length === 0 && !isVoiceOnlyMode
+  const voiceAvatarScale = 1 + assistantAudioLevel * 0.05
+  const voiceGlowOpacity = isAssistantAudioPlaying
+    ? 0.38 + assistantAudioLevel * 0.46
+    : 0
 
   return (
-    <div className="relative flex size-full flex-col divide-y overflow-hidden">
-      <Conversation>
+    <div
+      className="relative flex size-full flex-col divide-y overflow-hidden"
+      data-voice-only={isVoiceOnlyMode}
+    >
+      <Conversation className={isVoiceOnlyMode ? 'hidden' : undefined}>
         <ConversationContent>
           {messages.map(({ versions, ...message }) => (
             <MessageBranch defaultBranch={0} key={message.key}>
@@ -239,13 +307,27 @@ const ChatPage = () => {
                         !version.audioPlaybackComplete &&
                         version.contentStatus !== 'error' ? (
                           <AudioMessage
+                            onLevelChange={
+                              isVoiceOnlyMode
+                                ? handleAssistantAudioLevelChange
+                                : undefined
+                            }
                             onEnded={() => {
+                              setIsAssistantAudioPlaying(false)
+                              setAssistantAudioLevel(0)
                               completeAssistantResponse(version.id)
                             }}
                             onError={() => {
+                              setIsAssistantAudioPlaying(false)
+                              setAssistantAudioLevel(0)
                               failAssistantResponse(version.id)
                             }}
                             src={version.audioUrl}
+                            onPlaybackStart={
+                              isVoiceOnlyMode
+                                ? handleAssistantAudioStart
+                                : undefined
+                            }
                           />
                         ) : message.from === 'assistant' &&
                           version.audioPlaybackComplete &&
@@ -274,6 +356,32 @@ const ChatPage = () => {
         </ConversationContent>
         <ConversationScrollButton />
       </Conversation>
+      {isVoiceOnlyMode && (
+        <div className="flex min-h-0 flex-1 items-center justify-center p-6">
+          <div className="relative flex size-[22rem] items-center justify-center sm:size-[28rem]">
+            <div
+              aria-hidden="true"
+              className={
+                isAssistantAudioPlaying
+                  ? 'voice-avatar-blue-pulse'
+                  : 'voice-avatar-blue-idle'
+              }
+              style={{ opacity: voiceGlowOpacity }}
+            />
+            <img
+              alt="User profile"
+              className="relative z-10 size-72 rounded-full border-4 border-background object-cover shadow-xl transition-transform duration-150 sm:size-[22rem]"
+              src={defaultPersonProfileImageUrl}
+              style={{
+                boxShadow: isAssistantAudioPlaying
+                  ? '0 0 0 14px hsl(210 100% 72% / 0.26), 0 0 64px hsl(210 100% 56% / 0.36)'
+                  : '0 18px 45px hsl(0 0% 0% / 0.18)',
+                transform: `scale(${voiceAvatarScale})`,
+              }}
+            />
+          </div>
+        </div>
+      )}
       <div className="grid shrink-0 gap-4 pt-4">
         {shouldShowSuggestions && (
           <Suggestions className="px-4">
@@ -286,59 +394,77 @@ const ChatPage = () => {
             ))}
           </Suggestions>
         )}
-        <div className="w-full px-4 pb-4">
-          <PromptInput
-            className="[&_[data-slot=input-group]]:bg-[hsl(0_0%_100%_/_var(--prompt-input-surface-opacity))] [&_[data-slot=input-group]]:backdrop-blur-md"
-            globalDrop
-            multiple
-            onSubmit={handleSubmit}
-          >
-            <PromptInputHeader>
-              <PromptInputAttachmentsDisplay />
-            </PromptInputHeader>
-            <PromptInputBody>
-              <div className="relative w-full">
-                <PromptInputTextarea
-                  className="min-h-24 content-start text-left align-top"
-                  disabled={isTranscribing}
-                  onChange={handleTextChange}
-                  value={text}
-                />
-                {isTranscribing && (
-                  <div className="absolute inset-0 flex items-center justify-center rounded-md bg-background/50 backdrop-blur-[1px]">
-                    <Spinner />
-                  </div>
-                )}
-              </div>
-            </PromptInputBody>
-            <PromptInputFooter>
-              <PromptInputTools>
-                <PromptInputActionMenu>
-                  <PromptInputActionMenuTrigger />
-                  <PromptInputActionMenuContent>
-                    <PromptInputActionAddAttachments />
-                  </PromptInputActionMenuContent>
-                </PromptInputActionMenu>
-                <SpeechInput
-                  className="shrink-0"
-                  defaultLanguage="en"
-                  onTranscriptionChange={handleTranscriptionChange}
-                  onTranscriptionProcessingChange={
-                    handleTranscriptionProcessingChange
-                  }
-                  onTranscriptionStart={handleTranscriptionStart}
-                  size="icon-sm"
-                  variant="ghost"
-                />
-              </PromptInputTools>
-              <PromptInputSubmit
-                disabled={isSubmitDisabled}
-                onStop={interruptAssistantResponse}
-                status={status}
+        {isVoiceOnlyMode ? (
+          <div className="w-full px-4 pb-4">
+            <div className="flex items-center justify-between gap-3 rounded-md border bg-[hsl(0_0%_100%_/_var(--prompt-input-surface-opacity))] px-3 py-2 backdrop-blur-md">
+              <VoiceOnlyModeControl
+                checked={isVoiceOnlyMode}
+                onCheckedChange={handleVoiceOnlyModeChange}
               />
-            </PromptInputFooter>
-          </PromptInput>
-        </div>
+              <SpeechInput
+                className="shrink-0"
+                defaultLanguage="en"
+                disabled={isGenerating}
+                onTranscriptionChange={handleTranscriptionChange}
+                onTranscriptionProcessingChange={
+                  handleTranscriptionProcessingChange
+                }
+                onTranscriptionStart={handleTranscriptionStart}
+                size="icon-sm"
+                variant="ghost"
+              />
+            </div>
+          </div>
+        ) : (
+          <div className="w-full px-4 pb-4">
+            <PromptInput
+              className="[&_[data-slot=input-group]]:bg-[hsl(0_0%_100%_/_var(--prompt-input-surface-opacity))] [&_[data-slot=input-group]]:backdrop-blur-md"
+              maxFiles={0}
+              multiple
+              onSubmit={handleSubmit}
+            >
+              <PromptInputBody>
+                <div className="relative w-full">
+                  <PromptInputTextarea
+                    className="min-h-24 content-start text-left align-top"
+                    disabled={isTranscribing}
+                    onChange={handleTextChange}
+                    value={text}
+                  />
+                  {isTranscribing && (
+                    <div className="absolute inset-0 flex items-center justify-center rounded-md bg-background/50 backdrop-blur-[1px]">
+                      <Spinner />
+                    </div>
+                  )}
+                </div>
+              </PromptInputBody>
+              <PromptInputFooter>
+                <PromptInputTools>
+                  <VoiceOnlyModeControl
+                    checked={isVoiceOnlyMode}
+                    onCheckedChange={handleVoiceOnlyModeChange}
+                  />
+                  <SpeechInput
+                    className="shrink-0"
+                    defaultLanguage="en"
+                    onTranscriptionChange={handleTranscriptionChange}
+                    onTranscriptionProcessingChange={
+                      handleTranscriptionProcessingChange
+                    }
+                    onTranscriptionStart={handleTranscriptionStart}
+                    size="icon-sm"
+                    variant="ghost"
+                  />
+                </PromptInputTools>
+                <PromptInputSubmit
+                  disabled={isSubmitDisabled}
+                  onStop={interruptAssistantResponse}
+                  status={status}
+                />
+              </PromptInputFooter>
+            </PromptInput>
+          </div>
+        )}
       </div>
     </div>
   )
