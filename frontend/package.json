@@ -13,6 +13,7 @@
     "@ai-sdk/openai-compatible": "^3.0.2",
     "@ai-sdk/react": "^4.0.9",
     "@fontsource-variable/roboto-slab": "^5.2.8",
+    "@huggingface/transformers": "^4.2.0",
     "@radix-ui/react-use-controllable-state": "^1.2.3",
     "@rive-app/react-webgl2": "^4.29.3",
     "@shadcn/react": "^0.2.0",

@@ -43,6 +43,15 @@ pnpm dev
 
 Frontend will be [http://localhost:5173](http://localhost:5173)
 
+### PocketBase
+
+Navigate to `p-gpt/pocketbase/`, then run the PocketBase server.
+``` bash
+go run . serve
+```
+
+PocketBase will be [http://127.0.0.1:8090](http://127.0.0.1:8090) and the admin dashboard will be [http://127.0.0.1:8090/_/](http://127.0.0.1:8090/_/)
+
 
 ## Production
 
@@ -68,3 +77,16 @@ To preview the production build locally
 ``` bash
 pnpm preview
 ```
+
+### PocketBase
+
+For production, build the PocketBase app from `p-gpt/pocketbase/` using
+``` bash
+go build
+```
+
+Then start the compiled binary.
+``` bash
+./app serve
+```
+On Windows, run `./app.exe serve` instead.

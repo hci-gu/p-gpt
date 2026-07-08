@@ -9,6 +9,8 @@ const chatTextEndpoint = (chatId: string) =>
   `${apiEndpoint}/requests/${chatId}/text`
 const chatTtsStreamEndpoint = (chatId: string) =>
   `${apiEndpoint}/requests/${chatId}/audio`
+const chatInterruptEndpoint = (chatId: string) =>
+  `${apiEndpoint}/requests/${chatId}/interrupt`
 
 export interface MessageType {
   key: string
@@ -17,6 +19,8 @@ export interface MessageType {
   versions: {
     id: string
     content: string
+    contentStatus?: 'pending' | 'ready' | 'error'
+    audioPlaybackComplete?: boolean
     audioUrl?: string
   }[]
   reasoning?: {
@@ -39,6 +43,7 @@ export const suggestions = [
   'Who are you?',
   'Tell me your top 5 favorite movies',
   'What did you do yesterday?',
+  "Give me 5 bulletpoints list on what to bring on a camping trip and why."
 ]
 
 export type ChatStatus = 'submitted' | 'streaming' | 'ready' | 'error'
@@ -61,7 +66,10 @@ const toChatHistory = (messages: MessageType[]): ChatHistoryMessage[] =>
       .filter((message) => message.content)
   )
 
-const initializeChat = async (messages: ChatHistoryMessage[]) => {
+const initializeChat = async (
+  messages: ChatHistoryMessage[],
+  signal?: AbortSignal
+) => {
   const response = await fetch(chatInitializeEndpoint, {
     body: JSON.stringify({
       messages,
@@ -73,6 +81,7 @@ const initializeChat = async (messages: ChatHistoryMessage[]) => {
       'Content-Type': 'application/json',
     },
     method: 'POST',
+    signal,
   })
 
   if (!response.ok) {
@@ -102,11 +111,12 @@ const initializeChat = async (messages: ChatHistoryMessage[]) => {
   throw new Error('Chat initialization response did not include an id.')
 }
 
-const fetchTextResponse = async (chatId: string) => {
+const fetchTextResponse = async (chatId: string, signal?: AbortSignal) => {
   const response = await fetch(chatTextEndpoint(chatId), {
     headers: {
       Accept: 'application/json, text/plain',
     },
+    signal,
   })
 
   if (!response.ok) {
@@ -153,17 +163,28 @@ const fetchTextResponse = async (chatId: string) => {
 
 interface ChatState {
   text: string
+  transcriptionDraft:
+    | {
+        baseText: string
+        sessionId: string
+      }
+    | null
   useWebSearch: boolean
   status: ChatStatus
+  activeRequestAbortController: AbortController | null
+  activeRequestId: string | null
   messages: MessageType[]
   streamingMessageId: string | null
   setText: (text: string) => void
-  appendTranscription: (transcript: string) => void
+  beginTranscriptionDraft: (sessionId: string) => void
+  updateTranscriptionDraft: (sessionId: string, transcript: string) => void
+  finishTranscriptionDraft: (sessionId: string, transcript: string) => void
   toggleWebSearch: () => void
   updateMessageContent: (messageId: string, newContent: string) => void
   updateMessageAudio: (messageId: string, audioUrl: string) => void
   completeAssistantResponse: (messageId: string) => void
   failAssistantResponse: (messageId: string) => void
+  interruptAssistantResponse: () => Promise<void>
   fetchAssistantResponse: (
     messageId: string,
     history: ChatHistoryMessage[]
@@ -174,17 +195,55 @@ interface ChatState {
 
 export const useChatStore = create<ChatState>((set, get) => ({
   text: '',
+  transcriptionDraft: null,
   useWebSearch: false,
   status: 'ready',
+  activeRequestAbortController: null,
+  activeRequestId: null,
   messages: initialMessages,
   streamingMessageId: null,
   setText: (text) => {
-    set({ text })
+    set({ text, transcriptionDraft: null })
   },
-  appendTranscription: (transcript) => {
+  beginTranscriptionDraft: (sessionId) => {
     set((state) => ({
-      text: state.text ? `${state.text} ${transcript}` : transcript,
+      transcriptionDraft: {
+        baseText: state.text,
+        sessionId,
+      },
     }))
+  },
+  updateTranscriptionDraft: (sessionId, transcript) => {
+    set((state) => {
+      const draft =
+        state.transcriptionDraft?.sessionId === sessionId
+          ? state.transcriptionDraft
+          : { baseText: state.text, sessionId }
+      const cleanTranscript = transcript.trimStart()
+      const separator =
+        draft.baseText.trim() && cleanTranscript.trim() ? ' ' : ''
+
+      return {
+        text: `${draft.baseText}${separator}${cleanTranscript}`,
+        transcriptionDraft: draft,
+      }
+    })
+  },
+  finishTranscriptionDraft: (sessionId, transcript) => {
+    set((state) => {
+      const draft =
+        state.transcriptionDraft?.sessionId === sessionId
+          ? state.transcriptionDraft
+          : { baseText: state.text, sessionId }
+      const cleanTranscript = transcript.trim()
+      const separator =
+        draft.baseText.trim() && cleanTranscript ? ' ' : ''
+
+      return {
+        text: `${draft.baseText}${separator}${cleanTranscript}`,
+        transcriptionDraft: null,
+      }
+    })
   },
   toggleWebSearch: () => {
     set((state) => ({ useWebSearch: !state.useWebSearch }))
@@ -196,7 +255,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
           return {
             ...msg,
             versions: msg.versions.map((v) =>
-              v.id === messageId ? { ...v, content: newContent } : v
+              v.id === messageId
+                ? { ...v, content: newContent, contentStatus: 'ready' }
+                : v
             ),
           }
         }
@@ -211,7 +272,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
           return {
             ...msg,
             versions: msg.versions.map((v) =>
-              v.id === messageId ? { ...v, audioUrl } : v
+              v.id === messageId
+                ? { ...v, audioPlaybackComplete: false, audioUrl }
+                : v
             ),
           }
         }
@@ -225,28 +288,130 @@ export const useChatStore = create<ChatState>((set, get) => ({
         return state
       }
 
-      return { status: 'ready', streamingMessageId: null }
+      return {
+        messages: state.messages.map((msg) => {
+          if (msg.versions.some((v) => v.id === messageId)) {
+            return {
+              ...msg,
+              versions: msg.versions.map((v) =>
+                v.id === messageId
+                  ? { ...v, audioPlaybackComplete: true }
+                  : v
+              ),
+            }
+          }
+          return msg
+        }),
+        activeRequestAbortController: null,
+        activeRequestId: null,
+        status: 'ready',
+        streamingMessageId: null,
+      }
     })
   },
   failAssistantResponse: (messageId) => {
-    get().updateMessageContent(messageId, 'Failed to generate audio response.')
-    set({ status: 'error', streamingMessageId: null })
+    set((state) => ({
+      messages: state.messages.map((msg) => {
+        if (msg.versions.some((v) => v.id === messageId)) {
+          return {
+            ...msg,
+            versions: msg.versions.map((v) =>
+              v.id === messageId
+                ? {
+                    ...v,
+                    audioPlaybackComplete: true,
+                    content: 'Failed to generate audio response.',
+                    contentStatus: 'error',
+                  }
+                : v
+            ),
+          }
+        }
+        return msg
+      }),
+      activeRequestAbortController: null,
+      activeRequestId: null,
+      status: 'error',
+      streamingMessageId: null,
+    }))
   },
-  fetchAssistantResponse: async (messageId, history) => {
-    set({ status: 'streaming', streamingMessageId: messageId })
+  interruptAssistantResponse: async () => {
+    const { activeRequestAbortController, activeRequestId, streamingMessageId } =
+      get()
+
+    activeRequestAbortController?.abort()
+
+    set((state) => ({
+      activeRequestAbortController: null,
+      activeRequestId: null,
+      messages: streamingMessageId
+        ? state.messages.map((msg) => {
+            if (msg.versions.some((v) => v.id === streamingMessageId)) {
+              return {
+                ...msg,
+                versions: msg.versions.map((v) =>
+                  v.id === streamingMessageId
+                    ? {
+                        ...v,
+                        audioPlaybackComplete: true,
+                        audioUrl: undefined,
+                        content: 'Generation interrupted.',
+                        contentStatus: 'error',
+                      }
+                    : v
+                ),
+              }
+            }
+            return msg
+          })
+        : state.messages,
+      status: 'ready',
+      streamingMessageId: null,
+    }))
+
+    if (!activeRequestId) {
+      return
+    }
 
     try {
-      const chatId = await initializeChat(history)
+      await fetch(chatInterruptEndpoint(activeRequestId), { method: 'POST' })
+    } catch {
+      // The local abort has already restored the UI; backend cleanup is best effort.
+    }
+  },
+  fetchAssistantResponse: async (messageId, history) => {
+    const abortController = new AbortController()
+
+    set({
+      activeRequestAbortController: abortController,
+      activeRequestId: null,
+      status: 'streaming',
+      streamingMessageId: messageId,
+    })
+
+    try {
+      const chatId = await initializeChat(history, abortController.signal)
+      set((state) =>
+        state.streamingMessageId === messageId
+          ? { activeRequestId: chatId }
+          : state
+      )
       get().updateMessageAudio(messageId, chatTtsStreamEndpoint(chatId))
 
-      void fetchTextResponse(chatId)
+      void fetchTextResponse(chatId, abortController.signal)
         .then((text) => {
           get().updateMessageContent(messageId, text)
         })
-        .catch(() => {
+        .catch((error: unknown) => {
+          if (error instanceof DOMException && error.name === 'AbortError') {
+            return
+          }
           get().failAssistantResponse(messageId)
         })
-    } catch {
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') {
+        return
+      }
       get().failAssistantResponse(messageId)
     }
   },
@@ -258,6 +423,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       versions: [
         {
           content,
+          contentStatus: 'ready',
           id: userMessageId,
         },
       ],
@@ -273,7 +439,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
       key: assistantMessageId,
       versions: [
         {
-          content: 'Generating audio...',
+          audioPlaybackComplete: false,
+          content: '',
+          contentStatus: 'pending',
           id: assistantMessageId,
         },
       ],

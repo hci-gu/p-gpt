@@ -62,10 +62,14 @@ const decodePcm16Chunk = (
 export const AudioMessage = ({
   onEnded,
   onError,
+  onLevelChange,
+  onPlaybackStart,
   src,
 }: {
   onEnded: () => void
   onError: () => void
+  onLevelChange?: (level: number) => void
+  onPlaybackStart?: () => void
   src: string
 }) => {
   const activeSourceCountRef = useRef(0)
@@ -73,9 +77,12 @@ export const AudioMessage = ({
   const audioContextRef = useRef<AudioContext | null>(null)
   const currentLevelRef = useRef(0)
   const hasFinishedRef = useRef(false)
+  const hasStartedPlaybackRef = useRef(false)
   const nextStartTimeRef = useRef(0)
   const onEndedRef = useRef(onEnded)
   const onErrorRef = useRef(onError)
+  const onLevelChangeRef = useRef(onLevelChange)
+  const onPlaybackStartRef = useRef(onPlaybackStart)
   const streamDoneRef = useRef(false)
   const sourcesRef = useRef<AudioBufferSourceNode[]>([])
   const [level, setLevel] = useState(0)
@@ -83,6 +90,8 @@ export const AudioMessage = ({
 
   onEndedRef.current = onEnded
   onErrorRef.current = onError
+  onLevelChangeRef.current = onLevelChange
+  onPlaybackStartRef.current = onPlaybackStart
 
   useEffect(() => {
     const AudioContextConstructor = getAudioContextConstructor()
@@ -105,6 +114,7 @@ export const AudioMessage = ({
         animationRef.current = null
       }
       currentLevelRef.current = 0
+      onLevelChangeRef.current?.(0)
       setLevel(0)
       setBarLevels(createSilentLevels())
     }
@@ -142,6 +152,7 @@ export const AudioMessage = ({
         const average =
           levels.reduce((sum, value) => sum + value, 0) / levels.length
 
+        onLevelChangeRef.current?.(currentLevel)
         currentLevelRef.current *= 0.92
         setBarLevels(levels)
         setLevel(average)
@@ -172,6 +183,10 @@ export const AudioMessage = ({
         maybeFinishPlayback()
       }
       source.start(startTime)
+      if (!hasStartedPlaybackRef.current) {
+        hasStartedPlaybackRef.current = true
+        onPlaybackStartRef.current?.()
+      }
       nextStartTimeRef.current = startTime + audioBuffer.duration
     }
 

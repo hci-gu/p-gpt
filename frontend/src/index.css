@@ -134,4 +134,32 @@
   html {
     @apply font-serif;
   }
+
+  .chat-shell:has([data-voice-only="true"]) {
+    --chat-surface-opacity: 0;
+
+    @apply border-transparent bg-transparent shadow-none backdrop-blur-none;
+  }
+}
+
+@layer utilities {
+  @keyframes voice-avatar-pulse {
+    0%,
+    100% {
+      transform: scale(0.84);
+    }
+
+    50% {
+      transform: scale(1.24);
+    }
+  }
+
+  .voice-avatar-blue-idle,
+  .voice-avatar-blue-pulse {
+    @apply absolute -inset-8 rounded-full bg-blue-500 blur-3xl transition-opacity duration-500 ease-out sm:-inset-12;
+  }
+
+  .voice-avatar-blue-pulse {
+    animation: voice-avatar-pulse 1.35s ease-in-out infinite;
+  }
 }
