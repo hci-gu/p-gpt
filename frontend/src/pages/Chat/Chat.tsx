@@ -40,7 +40,9 @@ import { SpeechInput } from '@/components/ai-elements/speech-input'
 import type { TranscriptionEvent } from '@/components/ai-elements/speech-input'
 import { Suggestions } from '@/components/ai-elements/suggestion'
 import { Spinner } from '@/components/ui/spinner'
+import { Slider } from '@/components/ui/slider'
 import { Switch } from '@/components/ui/switch'
+import { MessageSquareTextIcon, SpeechIcon, Volume2Icon } from 'lucide-react'
 import type { ChangeEvent } from 'react'
 import { useCallback, useMemo, useRef, useState } from 'react'
 import defaultPersonProfileImageUrl from '../../../assets/default-person-pfp.png'
@@ -62,6 +64,7 @@ const getAssistantFallbackText = (
 }
 
 const transcriptionRevealDurationMs = 900
+const DEFAULT_TTS_VOLUME = 0.5
 
 const splitIntoRevealTokens = (content: string) =>
   content.match(/\S+\s*/g) ?? (content ? [content] : [])
@@ -73,10 +76,20 @@ const VoiceOnlyModeControl = ({
   checked: boolean
   onCheckedChange: (checked: boolean) => void
 }) => (
-  <label className="flex shrink-0 items-center gap-2 rounded-md px-2 py-1 text-muted-foreground text-xs">
-    <span>Voice only</span>
+  <label
+    className="flex h-8 shrink-0 cursor-pointer items-center gap-2 rounded-md border border-border/25 bg-accent/10 px-2 text-muted-foreground text-xs shadow-[0_1px_2px_hsl(0_0%_0%/0.04)] transition-colors hover:bg-accent hover:text-accent-foreground"
+    title={checked ? 'Switch to text chat' : 'Switch to voice-only mode'}
+  >
+    {checked ? (
+      <MessageSquareTextIcon aria-hidden="true" className="size-4" />
+    ) : (
+      <SpeechIcon aria-hidden="true" className="size-4" />
+    )}
+    <span className="sr-only">
+      {checked ? 'Text chat' : 'Voice-only mode'}
+    </span>
     <Switch
-      aria-label="Voice only mode"
+      aria-label={checked ? 'Switch to text chat' : 'Switch to voice-only mode'}
       checked={checked}
       className="data-checked:bg-green-500 dark:data-checked:bg-green-500"
       onCheckedChange={onCheckedChange}
@@ -84,6 +97,37 @@ const VoiceOnlyModeControl = ({
     />
   </label>
 )
+
+const VolumeControl = ({
+  onValueChange,
+  value,
+}: {
+  onValueChange: (value: number) => void
+  value: number
+}) => {
+  const volumePercent = Math.round(value * 100)
+
+  return (
+    <label
+      className="group/volume flex h-8 shrink-0 cursor-pointer items-center gap-0 rounded-md border border-border/25 bg-accent/10 px-2 text-muted-foreground text-xs shadow-[0_1px_2px_hsl(0_0%_0%/0.04)] transition-colors hover:bg-accent hover:text-accent-foreground focus-within:bg-accent focus-within:text-accent-foreground"
+      title={`TTS volume: ${volumePercent}%`}
+    >
+      <Volume2Icon aria-hidden="true" className="size-4 shrink-0" />
+      <span className="sr-only">TTS volume</span>
+      <span className="w-0 overflow-hidden opacity-0 transition-[width,opacity,margin] duration-200 group-hover/volume:ml-2 group-hover/volume:w-20 group-hover/volume:opacity-100 group-focus-within/volume:ml-2 group-focus-within/volume:w-20 group-focus-within/volume:opacity-100">
+        <Slider
+          aria-label="TTS volume"
+          className="h-8 w-20 [&_[data-slot=slider-range]]:bg-green-500"
+          max={100}
+          min={0}
+          onValueChange={([nextValue]) => onValueChange(nextValue / 100)}
+          step={1}
+          value={[volumePercent]}
+        />
+      </span>
+    </label>
+  )
+}
 
 const ChatPage = () => {
   const text = useChatStore((state) => state.text)
@@ -111,6 +155,7 @@ const ChatPage = () => {
   )
   const [isTranscribing, setIsTranscribing] = useState(false)
   const [isVoiceOnlyMode, setIsVoiceOnlyMode] = useState(false)
+  const [ttsVolume, setTtsVolume] = useState(DEFAULT_TTS_VOLUME)
   const [isAssistantAudioPlaying, setIsAssistantAudioPlaying] = useState(false)
   const [assistantAudioLevel, setAssistantAudioLevel] = useState(0)
   const transcriptionAnimationRef = useRef<number | null>(null)
@@ -323,6 +368,7 @@ const ChatPage = () => {
                               failAssistantResponse(version.id)
                             }}
                             src={version.audioUrl}
+                            volume={ttsVolume}
                             onPlaybackStart={
                               isVoiceOnlyMode
                                 ? handleAssistantAudioStart
@@ -396,10 +442,14 @@ const ChatPage = () => {
         )}
         {isVoiceOnlyMode ? (
           <div className="w-full px-4 pb-4">
-            <div className="flex items-center justify-between gap-3 rounded-md border bg-[hsl(0_0%_100%_/_var(--prompt-input-surface-opacity))] px-3 py-2 backdrop-blur-md">
+            <div className="flex items-center justify-start gap-1 rounded-md border bg-[hsl(0_0%_100%_/_var(--prompt-input-surface-opacity))] px-3 py-2 backdrop-blur-md">
               <VoiceOnlyModeControl
                 checked={isVoiceOnlyMode}
                 onCheckedChange={handleVoiceOnlyModeChange}
+              />
+              <VolumeControl
+                onValueChange={setTtsVolume}
+                value={ttsVolume}
               />
               <SpeechInput
                 className="shrink-0"
@@ -410,6 +460,7 @@ const ChatPage = () => {
                   handleTranscriptionProcessingChange
                 }
                 onTranscriptionStart={handleTranscriptionStart}
+                showMicrophone={false}
                 size="icon-sm"
                 variant="ghost"
               />
@@ -443,6 +494,10 @@ const ChatPage = () => {
                   <VoiceOnlyModeControl
                     checked={isVoiceOnlyMode}
                     onCheckedChange={handleVoiceOnlyModeChange}
+                  />
+                  <VolumeControl
+                    onValueChange={setTtsVolume}
+                    value={ttsVolume}
                   />
                   <SpeechInput
                     className="shrink-0"

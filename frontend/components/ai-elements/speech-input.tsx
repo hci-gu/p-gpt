@@ -40,6 +40,7 @@ export type SpeechInputProps = Omit<
   onTranscriptionError?: (error: string) => void;
   onTranscriptionProcessingChange?: (isProcessing: boolean) => void;
   onTranscriptionStart?: (sessionId: string) => void;
+  showMicrophone?: boolean;
 };
 
 const targetSampleRate = 16_000;
@@ -114,6 +115,7 @@ export const SpeechInput = ({
   onTranscriptionError,
   onTranscriptionProcessingChange,
   onTranscriptionStart,
+  showMicrophone = true,
   ...props
 }: SpeechInputProps) => {
   const [language, setLanguage] = useState<SpeechLanguage>(defaultLanguage);
@@ -394,7 +396,7 @@ export const SpeechInput = ({
         aria-label={`Switch transcription language, currently ${
           language === "en" ? "English" : "Swedish"
         }`}
-        className="h-8 gap-1 px-2 text-xs uppercase"
+        className="h-8 gap-1 border border-border/25 bg-accent/10 px-2 text-xs uppercase shadow-[0_1px_2px_hsl(0_0%_0%/0.04)] hover:bg-accent"
         disabled={disabled || isRecording || isLoading || !isSupported}
         onClick={toggleLanguage}
         type="button"
@@ -403,36 +405,38 @@ export const SpeechInput = ({
         <LanguagesIcon className="size-3.5" />
         {language}
       </Button>
-      <div className="relative inline-flex items-center justify-center">
-        {isRecording &&
-          [0, 1, 2].map((index) => (
-            <div
-              className="absolute inset-0 animate-ping rounded-full border-2 border-red-400/30"
-              key={index}
-              style={{
-                animationDelay: `${index * 0.3}s`,
-                animationDuration: "2s",
-              }}
-            />
-          ))}
-        <Button
-          aria-label={isRecording ? "Stop transcription" : "Start transcription"}
-          className={cn(
-            "relative z-10 rounded-full transition-all duration-300",
-            isRecording &&
-              "bg-destructive text-white hover:bg-destructive/80 hover:text-white",
-            className
-          )}
-          disabled={isDisabled}
-          onClick={toggleRecording}
-          type="button"
-          {...props}
-        >
-          {isLoading && <Spinner />}
-          {!isLoading && isRecording && <SquareIcon className="size-4" />}
-          {!(isLoading || isRecording) && <MicIcon className="size-4" />}
-        </Button>
-      </div>
+      {showMicrophone && (
+        <div className="relative inline-flex items-center justify-center">
+          {isRecording &&
+            [0, 1, 2].map((index) => (
+              <div
+                className="absolute inset-0 animate-ping rounded-full border-2 border-red-400/30"
+                key={index}
+                style={{
+                  animationDelay: `${index * 0.3}s`,
+                  animationDuration: "2s",
+                }}
+              />
+            ))}
+          <Button
+            aria-label={isRecording ? "Stop transcription" : "Start transcription"}
+            className={cn(
+              "relative z-10 size-8 rounded-full border border-border/25 bg-accent/10 shadow-[0_1px_2px_hsl(0_0%_0%/0.04)] transition-all duration-300 hover:bg-accent",
+              isRecording &&
+                "bg-destructive text-white hover:bg-destructive/80 hover:text-white",
+              className
+            )}
+            disabled={isDisabled}
+            onClick={toggleRecording}
+            type="button"
+            {...props}
+          >
+            {isLoading && <Spinner />}
+            {!isLoading && isRecording && <SquareIcon className="size-4" />}
+            {!(isLoading || isRecording) && <MicIcon className="size-4" />}
+          </Button>
+        </div>
+      )}
     </div>
   );
 };
