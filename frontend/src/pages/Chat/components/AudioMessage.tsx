@@ -65,17 +65,21 @@ export const AudioMessage = ({
   onLevelChange,
   onPlaybackStart,
   src,
+  volume,
 }: {
   onEnded: () => void
   onError: () => void
   onLevelChange?: (level: number) => void
   onPlaybackStart?: () => void
   src: string
+  volume: number
 }) => {
   const activeSourceCountRef = useRef(0)
   const animationRef = useRef<number | null>(null)
   const audioContextRef = useRef<AudioContext | null>(null)
   const currentLevelRef = useRef(0)
+  const gainNodeRef = useRef<GainNode | null>(null)
+  const initialVolumeRef = useRef(volume)
   const hasFinishedRef = useRef(false)
   const hasStartedPlaybackRef = useRef(false)
   const nextStartTimeRef = useRef(0)
@@ -94,6 +98,17 @@ export const AudioMessage = ({
   onPlaybackStartRef.current = onPlaybackStart
 
   useEffect(() => {
+    const gainNode = gainNodeRef.current
+
+    if (gainNode) {
+      gainNode.gain.setValueAtTime(
+        Math.min(1, Math.max(0, volume)),
+        gainNode.context.currentTime
+      )
+    }
+  }, [volume])
+
+  useEffect(() => {
     const AudioContextConstructor = getAudioContextConstructor()
     const abortController = new AbortController()
 
@@ -105,7 +120,11 @@ export const AudioMessage = ({
     const audioContext = new AudioContextConstructor({
       sampleRate: pcmSampleRate,
     })
+    const gainNode = audioContext.createGain()
+    gainNode.gain.value = Math.min(1, Math.max(0, initialVolumeRef.current))
+    gainNode.connect(audioContext.destination)
     audioContextRef.current = audioContext
+    gainNodeRef.current = gainNode
     nextStartTimeRef.current = audioContext.currentTime + 0.08
 
     const stopVisuals = () => {
@@ -174,7 +193,7 @@ export const AudioMessage = ({
       )
 
       source.buffer = audioBuffer
-      source.connect(audioContext.destination)
+      source.connect(gainNode)
       activeSourceCountRef.current += 1
       sourcesRef.current.push(source)
       source.onended = () => {
@@ -259,6 +278,8 @@ export const AudioMessage = ({
         }
       }
       sourcesRef.current = []
+      gainNodeRef.current = null
+      gainNode.disconnect()
       void audioContext.close()
     }
   }, [src])
