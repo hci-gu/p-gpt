@@ -29,12 +29,12 @@ logger = logging.getLogger(__name__)
 pending_requests: dict[str, "RequestState"] = {}
 CANCELLED_REQUEST_DETAIL = "Request interrupted."
 
-REMOTE_HOST = os.getnenv("INFERENCE_HOST","100.113.76.118") # Spark IP
+INFERENCE_HOST= os.getnenv("INFERENCE_HOST","100.113.76.118") # Spark IP
 
-OLLAMA_BASE_URL = f"http://{REMOTE_HOST}:11434"
+OLLAMA_BASE_URL = f"http://{INFERENCE_HOST}:11434"
 OLLAMA_TEXT_MODEL = "gemma4:e4b"
 
-VLLM_BASE_URL = f"http://{REMOTE_HOST}:8000/v1"
+VLLM_BASE_URL = f"http://{INFERENCE_HOST}:8001/v1"
 VLLM_TTS_MODEL = "mistralai/Voxtral-4B-TTS-2603"
 POCKETBASE_BASE_URL = os.getenv("POCKETBASE_BASE_URL", "http://127.0.0.1:8090").rstrip("/")
 
