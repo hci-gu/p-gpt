@@ -47,6 +47,7 @@ import type { ChangeEvent } from 'react'
 import { useCallback, useMemo, useRef, useState } from 'react'
 import defaultPersonProfileImageUrl from '../../../assets/default-person-pfp.png'
 import { suggestions, useChatStore } from '../../state/chat'
+import { usePersonasStore } from '../../state/personas'
 import {
   AnimatedMessageResponse,
   AudioMessage,
@@ -133,6 +134,11 @@ const ChatPage = () => {
   const text = useChatStore((state) => state.text)
   const status = useChatStore((state) => state.status)
   const messages = useChatStore((state) => state.messages)
+  const activePersonaId = useChatStore((state) => state.activePersonaId)
+  const personas = usePersonasStore((state) => state.personas)
+  const selectedPersonaId = usePersonasStore(
+    (state) => state.selectedPersonaId
+  )
   const setText = useChatStore((state) => state.setText)
   const beginTranscriptionDraft = useChatStore(
     (state) => state.beginTranscriptionDraft
@@ -308,6 +314,11 @@ const ChatPage = () => {
   const voiceGlowOpacity = isAssistantAudioPlaying
     ? 0.38 + assistantAudioLevel * 0.46
     : 0
+  const activePersona = personas.find(
+    (persona) => persona.id === (activePersonaId ?? selectedPersonaId)
+  )
+  const activePersonaProfileImageUrl =
+    activePersona?.profilePictureUrl ?? defaultPersonProfileImageUrl
 
   return (
     <div
@@ -415,9 +426,13 @@ const ChatPage = () => {
               style={{ opacity: voiceGlowOpacity }}
             />
             <img
-              alt="User profile"
+              alt={
+                activePersona
+                  ? `${activePersona.name} profile`
+                  : 'Persona profile'
+              }
               className="relative z-10 size-72 rounded-full border-4 border-background object-cover shadow-xl transition-transform duration-150 sm:size-[22rem]"
-              src={defaultPersonProfileImageUrl}
+              src={activePersonaProfileImageUrl}
               style={{
                 boxShadow: isAssistantAudioPlaying
                   ? '0 0 0 14px hsl(210 100% 72% / 0.26), 0 0 64px hsl(210 100% 56% / 0.36)'
