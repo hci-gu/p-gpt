@@ -1,6 +1,7 @@
 package main
 
 import (
+	_ "app/migrations"
 	"log"
 	"os"
 
