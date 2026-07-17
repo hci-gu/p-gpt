@@ -31,9 +31,10 @@ Navigate to `p-gpt/frontend/`, install dependencies, then run the Vite dev serve
 pnpm install
 ```
 
-Create a `.env.local` file in `p-gpt/frontend/` with the backend API endpoint.
+Create a `.env.local` file in `p-gpt/frontend/` with the backend and PocketBase API endpoints.
 ``` env
 VITE_API_ENDPOINT=http://127.0.0.1:8000
+VITE_POCKETBASE_ENDPOINT=http://127.0.0.1:8090
 ```
 
 To spin up the frontend
