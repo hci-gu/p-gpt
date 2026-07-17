@@ -1,8 +1,11 @@
 from collections.abc import AsyncIterator
 import asyncio
+import base64
 import logging
+import os
 from time import perf_counter
 from typing import Any, Literal
+from urllib.parse import urlparse
 from uuid import uuid4
 
 import httpx
@@ -26,13 +29,14 @@ logger = logging.getLogger(__name__)
 pending_requests: dict[str, "RequestState"] = {}
 CANCELLED_REQUEST_DETAIL = "Request interrupted."
 
-REMOTE_HOST = "100.113.76.118"
+REMOTE_HOST = os.getnenv("INFERENCE_HOST","100.113.76.118") # Spark IP
 
 OLLAMA_BASE_URL = f"http://{REMOTE_HOST}:11434"
 OLLAMA_TEXT_MODEL = "gemma4:e4b"
 
 VLLM_BASE_URL = f"http://{REMOTE_HOST}:8000/v1"
 VLLM_TTS_MODEL = "mistralai/Voxtral-4B-TTS-2603"
+POCKETBASE_BASE_URL = os.getenv("POCKETBASE_BASE_URL", "http://127.0.0.1:8090").rstrip("/")
 
 
 class ChatMessage(BaseModel):
@@ -47,6 +51,8 @@ class TextGenerationRequest(BaseModel):
     model: str = OLLAMA_TEXT_MODEL
     temperature: float = 1.0
     top_p: float = 0.95
+    repeat_penalty: float = 1.0
+    seed: int | None = None
     max_tokens: int = 1024
     think: bool | Literal["low", "medium", "high", "max"] = False
     reasoning_effort: Literal["none", "low", "medium", "high", "max"] | None = None
@@ -64,6 +70,8 @@ class StreamTTSRequest(TextGenerationRequest):
     tts_model: str = VLLM_TTS_MODEL
     response_format: Literal["wav", "mp3", "opus", "aac", "flac", "pcm"] = "wav"
     voice: str = "casual_male"
+    clone_voice: bool = True
+    ref_audio: str | None = None
     stream_audio: bool = True
     text_generation_timeout_seconds: float = Field(default=60, gt=0)
     tts_timeout_seconds: float = Field(default=120, gt=0)
@@ -75,12 +83,16 @@ class InitiateRequest(BaseModel):
     model: str = OLLAMA_TEXT_MODEL
     temperature: float = 1.0
     top_p: float = 0.95
+    repeat_penalty: float = 1.0
+    seed: int | None = None
     max_tokens: int = 1024
     think: bool | Literal["low", "medium", "high", "max"] = False
     reasoning_effort: Literal["none", "low", "medium", "high", "max"] | None = None
     tts_model: str = VLLM_TTS_MODEL
     response_format: Literal["wav", "mp3", "opus", "aac", "flac", "pcm"] = "wav"
     voice: str = "casual_male"
+    clone_voice: bool = True
+    ref_audio: str | None = None
     stream_audio: bool = True
     text_generation_timeout_seconds: float = Field(default=60, gt=0)
     tts_timeout_seconds: float = Field(default=120, gt=0)
@@ -132,9 +144,12 @@ def _build_ollama_chat_payload(request: TextGenerationRequest) -> dict[str, Any]
         "options": {
             "temperature": request.temperature,
             "top_p": request.top_p,
+            "repeat_penalty": request.repeat_penalty,
             "num_predict": request.max_tokens,
         },
     }
+    if request.seed is not None:
+        payload["options"]["seed"] = request.seed
 
     payload["think"] = request.think
     if request.reasoning_effort and request.reasoning_effort != "none":
@@ -184,13 +199,55 @@ def _extract_ollama_response_text(response_data: dict[str, Any]) -> str:
     raise HTTPException(status_code=502, detail=detail)
 
 
-def _build_tts_payload(generated_text: str, request: StreamTTSRequest) -> dict[str, str | bool]:
-    payload: dict[str, str | bool] = {
+async def _prepare_reference_audio(ref_audio: str) -> str:
+    parsed_reference = urlparse(ref_audio)
+    parsed_pocketbase = urlparse(POCKETBASE_BASE_URL)
+    is_pocketbase_file = (
+        parsed_reference.scheme == parsed_pocketbase.scheme
+        and parsed_reference.netloc == parsed_pocketbase.netloc
+        and parsed_reference.path.startswith("/api/files/")
+    )
+    if not is_pocketbase_file:
+        raise HTTPException(
+            status_code=422,
+            detail="Voice reference must be a PocketBase file URL.",
+        )
+
+    try:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=False) as client:
+            response = await client.get(ref_audio)
+            response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="PocketBase could not provide the persona audio sample.",
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Could not load the persona audio sample from PocketBase.",
+        ) from exc
+
+    content_type = response.headers.get("content-type", "audio/wav").split(";", 1)[0]
+    if not content_type.startswith("audio/"):
+        raise HTTPException(status_code=422, detail="Persona reference is not audio.")
+
+    encoded_audio = base64.b64encode(response.content).decode("ascii")
+    return f"data:{content_type};base64,{encoded_audio}"
+
+
+async def _build_tts_payload(
+    generated_text: str, request: StreamTTSRequest
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
         "input": generated_text,
         "model": request.tts_model,
         "response_format": request.response_format,
-        "voice": request.voice,
     }
+    if request.clone_voice and request.ref_audio:
+        payload["ref_audio"] = await _prepare_reference_audio(request.ref_audio)
+    else:
+        payload["voice"] = request.voice
 
     # vLLM-Omni raw audio streaming is reliable for PCM. Some model/format
     # combinations, including Voxtral WAV in our setup, close chunked responses
@@ -210,12 +267,16 @@ def _stream_request_from_initiate_request(request: InitiateRequest) -> StreamTTS
         model=request.model,
         temperature=request.temperature,
         top_p=request.top_p,
+        repeat_penalty=request.repeat_penalty,
+        seed=request.seed,
         max_tokens=request.max_tokens,
         think=request.think,
         reasoning_effort=request.reasoning_effort,
         tts_model=request.tts_model,
         response_format=request.response_format,
         voice=request.voice,
+        clone_voice=request.clone_voice,
+        ref_audio=request.ref_audio,
         stream_audio=request.stream_audio,
         text_generation_timeout_seconds=request.text_generation_timeout_seconds,
         tts_timeout_seconds=request.tts_timeout_seconds,
@@ -512,7 +573,7 @@ async def stream_initiated_request_audio(request_id: str) -> StreamingResponse:
         raise HTTPException(status_code=499, detail=CANCELLED_REQUEST_DETAIL)
 
     request_start = perf_counter()
-    tts_payload = _build_tts_payload(generated_text, request)
+    tts_payload = await _build_tts_payload(generated_text, request)
 
     client = httpx.AsyncClient(timeout=request.tts_timeout_seconds)
     tts_request_start = perf_counter()
@@ -632,7 +693,7 @@ async def stream_tts(request: StreamTTSRequest) -> StreamingResponse:
     print(f"Text response: {text_response}")
     text_generation_seconds = perf_counter() - request_start
     generated_text = _extract_ollama_response_text(text_response)
-    tts_payload = _build_tts_payload(generated_text, request)
+    tts_payload = await _build_tts_payload(generated_text, request)
 
     client = httpx.AsyncClient(timeout=request.tts_timeout_seconds)
     tts_request_start = perf_counter()
@@ -735,7 +796,7 @@ async def stream_tts_diagnostics(request: StreamTTSRequest) -> dict[str, Any]:
     )
     text_generation_seconds = perf_counter() - request_start
     generated_text = _extract_ollama_response_text(text_response)
-    tts_payload = _build_tts_payload(generated_text, request)
+    tts_payload = await _build_tts_payload(generated_text, request)
 
     chunk_events: list[dict[str, float | int]] = []
     total_audio_bytes = 0
