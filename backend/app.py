@@ -2,11 +2,14 @@ from collections.abc import AsyncIterator
 import asyncio
 import base64
 import logging
+import torch
+from omnivoice import OmniVoice
 import os
 from time import perf_counter
 from typing import Any, Literal
 from urllib.parse import urlparse
 from uuid import uuid4
+from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI, HTTPException, Response
@@ -14,7 +17,23 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-app = FastAPI()
+logger = logging.getLogger(__name__)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    logger.info(f"Loading in TTS model OmniVoice using device: {device}")
+
+    model = OmniVoice(
+        "k2-fa/OmniVoice",
+        device_map=device,
+        dtype=torch.bfloat16
+    )
+    yield
+    del model
+    logger.info(f"Cleaning up model from GPU")
+
+app = FastAPI(lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -25,7 +44,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-logger = logging.getLogger(__name__)
 pending_requests: dict[str, "RequestState"] = {}
 CANCELLED_REQUEST_DETAIL = "Request interrupted."
 
