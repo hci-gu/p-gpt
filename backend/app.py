@@ -613,7 +613,6 @@ async def stream_initiated_request_audio(request_id: str) -> StreamingResponse:
                     break
 
                 if chunk:
-                    print(f"Received audio chunk of size {len(chunk)} bytes for request ID: {request_id}")
                     now = perf_counter()
                     chunk_count += 1
                     total_bytes += len(chunk)
@@ -627,7 +626,6 @@ async def stream_initiated_request_audio(request_id: str) -> StreamingResponse:
                             request_id,
                         )
 
-                    print(f"Yielding audio chunk of size {len(chunk)} bytes for request ID: {request_id}")
                     yield chunk
         except httpx.RemoteProtocolError:
             logger.exception(
