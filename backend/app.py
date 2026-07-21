@@ -1,17 +1,79 @@
-from collections.abc import AsyncIterator
 import asyncio
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from io import BytesIO
+import json
 import logging
-from time import perf_counter
+import os
+import re
+from time import perf_counter, time
 from typing import Any, Literal
+from urllib.parse import urlparse
 from uuid import uuid4
+from config import settings
 
 import httpx
-from fastapi import FastAPI, HTTPException, Response
+import soundfile as sf
+import torch
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
+from omnivoice import OmniVoice, VoiceClonePrompt
 from pydantic import BaseModel, Field
 
-app = FastAPI()
+# FastAPI's development runner configures the Uvicorn logger hierarchy rather
+# than the root/module logger. Using a child keeps application INFO messages in
+# the same terminal feed as server startup and request logs.
+logger = logging.getLogger("uvicorn.error.p_gpt")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+    logger.info("Loading OmniVoice on %s", device)
+
+    model = OmniVoice.from_pretrained(
+        settings.tts_model,
+        device_map=device,
+        dtype=dtype,
+        # Persona references do not currently include transcripts, so the ASR
+        # model is required to construct voice-cloning prompts.
+        load_asr=True,
+        asr_device=device,
+    )
+    app.state.tts_model = model
+    app.state.tts_lock = asyncio.Lock()
+    app.state.voice_clone_prompts = {}
+    app.state.voice_clone_prompt_tasks = {}
+
+    logger.info("OmniVoice is online; running warmup inference")
+    warmup_start = time()
+    await asyncio.to_thread(
+        model.generate,
+        text="This is a warmup generation. Feel free to discard this output.",
+        num_step=26,
+        speed=0.8,
+    )
+    logger.info("OmniVoice warmup took %.2fs", time() - warmup_start)
+
+    try:
+        yield
+    finally:
+        prompt_tasks = list(app.state.voice_clone_prompt_tasks.values())
+        if prompt_tasks:
+            await asyncio.gather(*prompt_tasks, return_exceptions=True)
+        app.state.voice_clone_prompts.clear()
+        app.state.voice_clone_prompt_tasks.clear()
+        del app.state.tts_model
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        logger.info("OmniVoice shut down and released its model resources")
+
+
+# Define backend application
+app = FastAPI(lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -22,17 +84,19 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-logger = logging.getLogger(__name__)
 pending_requests: dict[str, "RequestState"] = {}
+pseudo_stream_requests: dict[str, "PseudoStreamRequestState"] = {}
 CANCELLED_REQUEST_DETAIL = "Request interrupted."
 
-REMOTE_HOST = "100.113.76.118"
+OLLAMA_BASE_URL = settings.ollama_base_url
+OLLAMA_TEXT_MODEL = settings.ollama_text_model
 
-OLLAMA_BASE_URL = f"http://{REMOTE_HOST}:11434"
-OLLAMA_TEXT_MODEL = "gemma4:e4b"
-
-VLLM_BASE_URL = f"http://{REMOTE_HOST}:8000/v1"
-VLLM_TTS_MODEL = "mistralai/Voxtral-4B-TTS-2603"
+OMNIVOICE_TTS_MODEL = settings.tts_model
+OMNIVOICE_SAMPLE_RATE = 24_000
+POCKETBASE_BASE_URL = os.getenv(
+    "POCKETBASE_BASE_URL",
+    settings.pocketbase_base_url,
+).rstrip("/")
 
 
 class ChatMessage(BaseModel):
@@ -47,26 +111,24 @@ class TextGenerationRequest(BaseModel):
     model: str = OLLAMA_TEXT_MODEL
     temperature: float = 1.0
     top_p: float = 0.95
+    repeat_penalty: float = 1.0
+    seed: int | None = None
     max_tokens: int = 1024
     think: bool | Literal["low", "medium", "high", "max"] = False
     reasoning_effort: Literal["none", "low", "medium", "high", "max"] | None = None
 
 
-class TTSRequest(BaseModel):
-    input: str
-    model: str = VLLM_TTS_MODEL
-    response_format: Literal["wav", "mp3", "opus", "aac", "flac"] = "wav"
-    voice: str = "casual_male"
-    timeout_seconds: float = Field(default=20, gt=0)
-
-
 class StreamTTSRequest(TextGenerationRequest):
-    tts_model: str = VLLM_TTS_MODEL
+    tts_model: str = OMNIVOICE_TTS_MODEL
     response_format: Literal["wav", "mp3", "opus", "aac", "flac", "pcm"] = "wav"
     voice: str = "casual_male"
+    clone_voice: bool = True
+    ref_audio: str | None = None
     stream_audio: bool = True
+    num_step: int = Field(default=26, gt=0)
+    speed: float = Field(default=0.8, gt=0)
     text_generation_timeout_seconds: float = Field(default=60, gt=0)
-    tts_timeout_seconds: float = Field(default=120, gt=0)
+    tts_timeout_seconds: float = Field(default=300, gt=0)
     audio_chunk_size: int = Field(default=8192, gt=0)
 
 
@@ -75,15 +137,21 @@ class InitiateRequest(BaseModel):
     model: str = OLLAMA_TEXT_MODEL
     temperature: float = 1.0
     top_p: float = 0.95
+    repeat_penalty: float = 1.0
+    seed: int | None = None
     max_tokens: int = 1024
     think: bool | Literal["low", "medium", "high", "max"] = False
     reasoning_effort: Literal["none", "low", "medium", "high", "max"] | None = None
-    tts_model: str = VLLM_TTS_MODEL
+    tts_model: str = OMNIVOICE_TTS_MODEL
     response_format: Literal["wav", "mp3", "opus", "aac", "flac", "pcm"] = "wav"
     voice: str = "casual_male"
+    clone_voice: bool = True
+    ref_audio: str | None = None
     stream_audio: bool = True
+    num_step: int = Field(default=26, gt=0)
+    speed: float = Field(default=0.8, gt=0)
     text_generation_timeout_seconds: float = Field(default=60, gt=0)
-    tts_timeout_seconds: float = Field(default=120, gt=0)
+    tts_timeout_seconds: float = Field(default=300, gt=0)
     audio_chunk_size: int = Field(default=8192, gt=0)
 
 
@@ -97,6 +165,22 @@ class RequestState:
         self.text_generation_lock = asyncio.Lock()
         self.text_generation_started = False
         self.text_generation_task: asyncio.Task[Any] | None = None
+        self.tts_generation_task: asyncio.Task[Any] | None = None
+        self.voice_clone_prompt_task: asyncio.Task[VoiceClonePrompt] | None = None
+
+
+class PseudoStreamRequestState:
+    def __init__(self, request: StreamTTSRequest) -> None:
+        self.request = request
+        self.cancelled = False
+        self.error: str | None = None
+        self.generated_text: str | None = None
+        self.text_ready = asyncio.Event()
+        self.sentence_queue: asyncio.Queue[str | None] = asyncio.Queue()
+        self.text_generation_task: asyncio.Task[Any] | None = None
+        self.tts_generation_task: asyncio.Task[Any] | None = None
+        self.voice_clone_prompt_task: asyncio.Task[VoiceClonePrompt] | None = None
+        self.audio_started = False
 
 
 def _content_type_for_audio_format(response_format: str) -> str:
@@ -132,9 +216,12 @@ def _build_ollama_chat_payload(request: TextGenerationRequest) -> dict[str, Any]
         "options": {
             "temperature": request.temperature,
             "top_p": request.top_p,
+            "repeat_penalty": request.repeat_penalty,
             "num_predict": request.max_tokens,
         },
     }
+    if request.seed is not None:
+        payload["options"]["seed"] = request.seed
 
     payload["think"] = request.think
     if request.reasoning_effort and request.reasoning_effort != "none":
@@ -148,7 +235,7 @@ async def _generate_ollama_chat_response(
     timeout_seconds: float = 60,
 ) -> dict[str, Any]:
     payload = _build_ollama_chat_payload(request)
-    print(f"Sending request to Ollama: {payload}")
+    logger.info("Sending request to Ollama: %s", payload)
     try:
         async with httpx.AsyncClient(timeout=timeout_seconds) as client:
             response = await client.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload)
@@ -184,24 +271,354 @@ def _extract_ollama_response_text(response_data: dict[str, Any]) -> str:
     raise HTTPException(status_code=502, detail=detail)
 
 
-def _build_tts_payload(generated_text: str, request: StreamTTSRequest) -> dict[str, str | bool]:
-    payload: dict[str, str | bool] = {
-        "input": generated_text,
-        "model": request.tts_model,
-        "response_format": request.response_format,
-        "voice": request.voice,
-    }
+_SENTENCE_BOUNDARY = re.compile(r'[.!?]+(?:["\')\]]+)?(?=\s)')
+_NON_TERMINAL_ABBREVIATIONS = {
+    "dr",
+    "e.g",
+    "etc",
+    "i.e",
+    "jr",
+    "mr",
+    "mrs",
+    "ms",
+    "prof",
+    "sr",
+    "st",
+    "vs",
+}
 
-    # vLLM-Omni raw audio streaming is reliable for PCM. Some model/format
-    # combinations, including Voxtral WAV in our setup, close chunked responses
-    # mid-body when stream_format=audio is requested. Keep WAV browser-playable
-    # through the stable non-streaming upstream path until the frontend has a
-    # PCM/WebAudio player.
-    if request.stream_audio and request.response_format == "pcm":
-        payload["stream"] = True
-        payload["stream_format"] = "audio"
+
+def _is_non_terminal_period(text: str, boundary_start: int) -> bool:
+    if text[boundary_start] != ".":
+        return False
+
+    prefix = text[: boundary_start + 1]
+    word_match = re.search(r"([A-Za-z.]+)\.$", prefix)
+    if word_match is None:
+        return False
+
+    word = word_match.group(1)
+    return (
+        word.lower() in _NON_TERMINAL_ABBREVIATIONS
+        or (len(word) == 1 and word.isupper())
+    )
+
+
+def _extract_complete_sentences(text: str) -> tuple[list[str], str]:
+    sentences: list[str] = []
+    sentence_start = 0
+
+    for boundary in _SENTENCE_BOUNDARY.finditer(text):
+        if _is_non_terminal_period(text, boundary.start()):
+            continue
+
+        sentence = text[sentence_start : boundary.end()].strip()
+        if sentence:
+            sentences.append(sentence)
+        sentence_start = boundary.end()
+
+    return sentences, text[sentence_start:].lstrip()
+
+
+async def _run_pseudo_text_pipeline(
+    request_id: str,
+    state: PseudoStreamRequestState,
+) -> None:
+    payload = _build_ollama_chat_payload(state.request)
+    payload["stream"] = True
+    text_parts: list[str] = []
+    sentence_buffer = ""
+    pending_sentences: list[str] = []
+
+    logger.info("Starting streamed Ollama response: request_id=%s", request_id)
+    try:
+        async with httpx.AsyncClient(
+            timeout=state.request.text_generation_timeout_seconds
+        ) as client:
+            async with client.stream(
+                "POST",
+                f"{OLLAMA_BASE_URL}/api/chat",
+                json=payload,
+            ) as response:
+                response.raise_for_status()
+
+                async for line in response.aiter_lines():
+                    if state.cancelled:
+                        raise asyncio.CancelledError
+                    if not line:
+                        continue
+
+                    try:
+                        response_part = json.loads(line)
+                    except json.JSONDecodeError as exc:
+                        raise RuntimeError(
+                            "Ollama returned an invalid streaming response."
+                        ) from exc
+
+                    message = response_part.get("message")
+                    content = (
+                        message.get("content") if isinstance(message, dict) else None
+                    )
+                    if not isinstance(content, str) or not content:
+                        continue
+
+                    text_parts.append(content)
+                    sentence_buffer += content
+                    complete_sentences, sentence_buffer = (
+                        _extract_complete_sentences(sentence_buffer)
+                    )
+                    pending_sentences.extend(complete_sentences)
+
+                    while len(pending_sentences) >= 2:
+                        tts_text = " ".join(pending_sentences[:2]).strip()
+                        del pending_sentences[:2]
+                        if tts_text:
+                            await state.sentence_queue.put(tts_text)
+                            logger.info(
+                                "Queued two sentences for pseudo-stream TTS: "
+                                "request_id=%s characters=%s",
+                                request_id,
+                                len(tts_text),
+                            )
+
+        final_text = "".join(text_parts).strip()
+        if not final_text:
+            raise RuntimeError("Ollama response did not contain generated text.")
+
+        remaining_text = " ".join(
+            [*pending_sentences, sentence_buffer.strip()]
+        ).strip()
+        if remaining_text:
+            await state.sentence_queue.put(remaining_text)
+
+        state.generated_text = final_text
+        logger.info("Streamed Ollama response completed: request_id=%s", request_id)
+    except asyncio.CancelledError:
+        state.cancelled = True
+        state.error = CANCELLED_REQUEST_DETAIL
+    except httpx.HTTPStatusError as exc:
+        state.error = str(exc)
+        logger.exception("Streamed Ollama request failed: request_id=%s", request_id)
+    except Exception as exc:
+        state.error = str(exc)
+        logger.exception("Streamed Ollama request failed: request_id=%s", request_id)
+    finally:
+        state.text_generation_task = None
+        state.text_ready.set()
+        await state.sentence_queue.put(None)
+
+
+async def _prepare_reference_audio(ref_audio: str) -> tuple[torch.Tensor, int]:
+    parsed_reference = urlparse(ref_audio)
+    parsed_pocketbase = urlparse(POCKETBASE_BASE_URL)
+    is_pocketbase_file_path = (
+        parsed_reference.scheme in {"http", "https"}
+        and bool(parsed_reference.netloc)
+        and parsed_reference.path.startswith("/api/files/")
+    )
+    if not is_pocketbase_file_path:
+        raise HTTPException(
+            status_code=422,
+            detail="Voice reference must be a PocketBase file URL.",
+        )
+
+    # The frontend uses PocketBase's externally reachable address, while the
+    # backend can fetch the same file over loopback. Rebuild the URL against the
+    # configured local origin instead of trusting or requesting the supplied
+    # host, which also keeps this endpoint from becoming an SSRF proxy.
+    local_reference_url = parsed_pocketbase._replace(
+        path=parsed_reference.path,
+        params="",
+        query=parsed_reference.query,
+        fragment="",
+    ).geturl()
+    logger.info(
+        "Loading voice reference from PocketBase: supplied=%s local=%s",
+        ref_audio,
+        local_reference_url,
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=False) as client:
+            response = await client.get(local_reference_url)
+            response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="PocketBase could not provide the persona audio sample.",
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Could not load the persona audio sample from PocketBase.",
+        ) from exc
+
+    content_type = response.headers.get("content-type", "audio/wav").split(";", 1)[0]
+    if not content_type.startswith("audio/"):
+        raise HTTPException(status_code=422, detail="Persona reference is not audio.")
+
+    try:
+        audio_array, sample_rate = sf.read(
+            BytesIO(response.content),
+            dtype="float32",
+            always_2d=True,
+        )
+    except (RuntimeError, TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=422,
+            detail="Persona reference audio could not be decoded.",
+        ) from exc
+
+    # OmniVoice expects (channels, samples), while soundfile returns
+    # (samples, channels).
+    waveform = torch.from_numpy(audio_array.T.copy())
+    return waveform, sample_rate
+
+
+async def _create_voice_clone_prompt(ref_audio: str) -> VoiceClonePrompt:
+    reference_audio = await _prepare_reference_audio(ref_audio)
+    prompt_start = perf_counter()
+    logger.info("Creating VoiceClonePrompt for %s", ref_audio)
+
+    async with app.state.tts_lock:
+        prompt = await asyncio.to_thread(
+            app.state.tts_model.create_voice_clone_prompt,
+            ref_audio=reference_audio,
+        )
+
+    logger.info(
+        "VoiceClonePrompt created for %s in %.3fs",
+        ref_audio,
+        perf_counter() - prompt_start,
+    )
+    return prompt
+
+
+async def _get_or_create_voice_clone_prompt(ref_audio: str) -> VoiceClonePrompt:
+    cached_prompt = app.state.voice_clone_prompts.get(ref_audio)
+    if cached_prompt is not None:
+        logger.info("Using cached VoiceClonePrompt for %s", ref_audio)
+        return cached_prompt
+
+    prompt_task = app.state.voice_clone_prompt_tasks.get(ref_audio)
+    if prompt_task is None:
+        prompt_task = asyncio.create_task(_create_voice_clone_prompt(ref_audio))
+        app.state.voice_clone_prompt_tasks[ref_audio] = prompt_task
+
+    try:
+        prompt = await asyncio.shield(prompt_task)
+    finally:
+        if prompt_task.done():
+            app.state.voice_clone_prompt_tasks.pop(ref_audio, None)
+
+    app.state.voice_clone_prompts[ref_audio] = prompt
+    return prompt
+
+
+def _log_voice_clone_prompt_result(
+    request_id: str,
+    task: asyncio.Task[VoiceClonePrompt],
+) -> None:
+    if task.cancelled():
+        return
+    exception = task.exception()
+    if exception is not None:
+        logger.error(
+            "VoiceClonePrompt preparation failed: request_id=%s",
+            request_id,
+            exc_info=(type(exception), exception, exception.__traceback__),
+        )
+
+
+def _build_tts_payload(
+    generated_text: str,
+    request: StreamTTSRequest,
+    voice_clone_prompt: VoiceClonePrompt | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "text": generated_text,
+        "num_step": request.num_step,
+        "speed": request.speed,
+    }
+    if voice_clone_prompt is not None:
+        payload["voice_clone_prompt"] = voice_clone_prompt
 
     return payload
+
+
+async def _generate_pseudo_stream_audio(
+    text: str,
+    request: StreamTTSRequest,
+    voice_clone_prompt: VoiceClonePrompt | None,
+) -> bytes:
+    payload = _build_tts_payload(text, request, voice_clone_prompt)
+    payload.update(
+        {
+            "postprocess_output": False,
+            "pad_duration": 0.0,
+            "fade_duration": 0.0,
+        }
+    )
+    inference_task: asyncio.Task[list[Any]] | None = None
+
+    async with app.state.tts_lock:
+        inference_task = asyncio.create_task(
+            asyncio.to_thread(app.state.tts_model.generate, **payload)
+        )
+        try:
+            generated_audios = await asyncio.wait_for(
+                asyncio.shield(inference_task),
+                timeout=request.tts_timeout_seconds,
+            )
+        except (asyncio.CancelledError, TimeoutError):
+            # Local PyTorch work cannot be stopped safely. Retain the model
+            # lock until the worker finishes to prevent concurrent inference.
+            await inference_task
+            raise
+
+    if not generated_audios:
+        raise RuntimeError("OmniVoice generated no audio.")
+
+    sample_rate = int(app.state.tts_model.sampling_rate)
+    if sample_rate != OMNIVOICE_SAMPLE_RATE:
+        raise RuntimeError(
+            f"OmniVoice returned PCM at an unsupported {sample_rate} Hz."
+        )
+
+    return _encode_generated_audio(generated_audios[0], sample_rate, "pcm")
+
+
+def _encode_generated_audio(
+    audio_array: Any,
+    sample_rate: int,
+    response_format: str,
+) -> bytes:
+    output = BytesIO()
+    if response_format == "pcm":
+        sf.write(
+            output,
+            audio_array,
+            sample_rate,
+            format="RAW",
+            subtype="PCM_16",
+            endian="LITTLE",
+        )
+    elif response_format == "wav":
+        sf.write(
+            output,
+            audio_array,
+            sample_rate,
+            format="WAV",
+            subtype="PCM_16",
+        )
+    elif response_format == "mp3":
+        sf.write(output, audio_array, sample_rate, format="MP3")
+    else:
+        raise HTTPException(
+            status_code=422,
+            detail="OmniVoice output supports pcm, wav, or mp3.",
+        )
+    return output.getvalue()
 
 
 def _stream_request_from_initiate_request(request: InitiateRequest) -> StreamTTSRequest:
@@ -210,13 +627,19 @@ def _stream_request_from_initiate_request(request: InitiateRequest) -> StreamTTS
         model=request.model,
         temperature=request.temperature,
         top_p=request.top_p,
+        repeat_penalty=request.repeat_penalty,
+        seed=request.seed,
         max_tokens=request.max_tokens,
         think=request.think,
         reasoning_effort=request.reasoning_effort,
         tts_model=request.tts_model,
         response_format=request.response_format,
         voice=request.voice,
+        clone_voice=request.clone_voice,
+        ref_audio=request.ref_audio,
         stream_audio=request.stream_audio,
+        num_step=request.num_step,
+        speed=request.speed,
         text_generation_timeout_seconds=request.text_generation_timeout_seconds,
         tts_timeout_seconds=request.tts_timeout_seconds,
         audio_chunk_size=request.audio_chunk_size,
@@ -271,7 +694,7 @@ async def _get_or_generate_text(
             raise HTTPException(status_code=status_code, detail=state.error)
 
         state.text_generation_started = True
-        print("Generating text for request_id=%s", request_id)
+        logger.info(f"Generating text for request_id={request_id}")
         try:
             state.text_generation_task = asyncio.current_task()
             text_response = await _generate_ollama_chat_response(
@@ -280,7 +703,7 @@ async def _get_or_generate_text(
             )
             if state.cancelled:
                 raise HTTPException(status_code=499, detail=CANCELLED_REQUEST_DETAIL)
-            print(f"Text response for request_id={request_id}: {text_response}")
+            logger.info(f"Text response for request_id={request_id}: {text_response}")
             state.generated_text = _extract_ollama_response_text(text_response)
         except asyncio.CancelledError as exc:
             state.cancelled = True
@@ -298,7 +721,7 @@ async def _get_or_generate_text(
 
     if state.generated_text is None:
         raise HTTPException(status_code=502, detail="Text generation failed.")
-    logger.info("generated text for request_id=%s", request_id)
+    logger.info(f"Generated text for request_id={request_id}")
     return state.generated_text
 
 
@@ -308,154 +731,62 @@ def _interrupt_request_state(request_id: str, state: RequestState) -> dict[str, 
     state.text_ready.set()
 
     task = state.text_generation_task
-    task_cancelled = False
+    text_task_cancelled = False
     if task is not None and not task.done():
         task.cancel()
-        task_cancelled = True
+        text_task_cancelled = True
+
+    tts_task = state.tts_generation_task
+    tts_task_cancelled = False
+    if tts_task is not None and not tts_task.done():
+        tts_task.cancel()
+        tts_task_cancelled = True
 
     logger.info(
-        "interrupted request_id=%s text_generation_started=%s task_cancelled=%s",
+        "interrupted request_id=%s text_generation_started=%s "
+        "text_task_cancelled=%s tts_task_cancelled=%s",
         request_id,
         state.text_generation_started,
-        task_cancelled,
+        text_task_cancelled,
+        tts_task_cancelled,
     )
 
     return {
         "interrupted": True,
         "request_id": request_id,
-        "text_generation_task_cancelled": task_cancelled,
+        "text_generation_task_cancelled": text_task_cancelled,
+        "tts_generation_task_cancelled": tts_task_cancelled,
     }
 
-
-@app.get("/")
-def read_root():
-    return {"status": 200,"Hello": "World"}
-
-
-@app.get("/items/{item_id}")
-def read_item(item_id: int, q: str | None = None):
-    return {"item_id": item_id, "q": q}
-
-
-@app.post("/text-generation")
-async def generate_text(request: TextGenerationRequest) -> dict[str, Any]:
-    """Generate text through the remote Ollama chat endpoint.
-
-    Typical HTTP request:
-
-    ```http
-    POST /text-generation HTTP/1.1
-    Host: 127.0.0.1:8000
-    Content-Type: application/json
-
-    {
-      "prompt": "Give me a one-paragraph vLLM tuning checklist.",
-      "temperature": 1.0,
-      "top_p": 0.95,
-      "max_tokens": 256
-    }
-    ```
-
-    You can also send an explicit chat history instead of `prompt`:
-
-    ```json
-    {
-      "messages": [
-        {"role": "system", "content": "You are concise assistant. Answer helpfully"},
-        {"role": "user", "content": "Give me a one-paragraph vLLM tuning checklist."}
-      ]
-    }
-    ```
-    """
-    return await _generate_ollama_chat_response(request)
-
-
-@app.post("/tts")
-async def generate_tts(request: TTSRequest) -> Response:
-    """Generate speech audio through the remote vLLM TTS endpoint.
-
-    Typical HTTP request:
-
-    ```http
-    POST /tts HTTP/1.1
-    Host: 127.0.0.1:8000
-    Content-Type: application/json
-    Accept: audio/wav
-
-    {
-      "input": "Hello and welcome. How can I help you today?",
-      "voice": "casual_male",
-      "response_format": "wav"
-    }
-    ```
-
-    The response body is the generated audio bytes. Save it directly to a file
-    with the same extension as `response_format`, for example `output.wav`.
-    """
-    payload = request.model_dump(exclude={"timeout_seconds"})
-
-    try:
-        async with httpx.AsyncClient(timeout=request.timeout_seconds) as client:
-            response = await client.post(f"{VLLM_BASE_URL}/audio/speech", json=payload)
-            response.raise_for_status()
-    except httpx.HTTPStatusError as exc:
-        raise HTTPException(
-            status_code=exc.response.status_code,
-            detail=exc.response.text,
-        ) from exc
-    except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-    return Response(
-        content=response.content,
-        media_type=_content_type_for_audio_format(request.response_format),
-    )
 
 
 @app.post("/initiate-request")
 async def initiate_request(request: InitiateRequest) -> dict[str, str]:
-    """Store a conversation request and return a UUID for the stream endpoint.
-
-    Typical HTTP request:
-
-    ```http
-    POST /initiate-request HTTP/1.1
-    Host: 127.0.0.1:8000
-    Content-Type: application/json
-
-    {
-      "messages": [
-        {"role": "system", "content": "You are concise assistant. Answer helpfully"},
-        {"role": "user", "content": "Greet me and ask how you can help."}
-      ],
-      "voice": "casual_male",
-      "response_format": "wav"
-    }
-    ```
-
-    Use the returned `request_id` with `GET /requests/{request_id}/text` and
-    `GET /requests/{request_id}/audio`.
-    Requests are held in memory, so they are lost if the backend process restarts.
+    """Frontend's first point of contact for a message. Stores a conversation request and returns a UUID for the stream endpoint.
+    Use the returned `request_id` with
+        - `GET /requests/{request_id}/text`
+        - `GET /requests/{request_id}/audio`.
     """
     request_id = str(uuid4())
-    print(f"Initiating request with ID: {request_id}, request: {request}")
-    pending_requests[request_id] = RequestState(
-        _stream_request_from_initiate_request(request)
-    )
+    logger.info(f"Initiating request with ID: {request_id}")
+    state = RequestState(_stream_request_from_initiate_request(request))
+    pending_requests[request_id] = state
+
+    if state.request.clone_voice and state.request.ref_audio:
+        prompt_task = asyncio.create_task(
+            _get_or_create_voice_clone_prompt(state.request.ref_audio)
+        )
+        state.voice_clone_prompt_task = prompt_task
+        prompt_task.add_done_callback(
+            lambda task: _log_voice_clone_prompt_result(request_id, task)
+        )
+
     return {"request_id": request_id}
 
 
 @app.get("/requests/{request_id}/text")
 async def get_initiated_request_text(request_id: str) -> dict[str, Any]:
     """Generate and return the assistant text for an initiated request.
-
-    Typical HTTP request:
-
-    ```http
-    GET /requests/{request_id}/text HTTP/1.1
-    Host: 127.0.0.1:8000
-    Accept: application/json
-    ```
 
     The generated text is stored so `GET /requests/{request_id}/audio` can use it.
     If another client already generated the text, this endpoint returns the cached
@@ -465,7 +796,7 @@ async def get_initiated_request_text(request_id: str) -> dict[str, Any]:
     if state is None:
         raise HTTPException(status_code=404, detail="Unknown request_id.")
 
-    print(f"Fetching text for request ID: {request_id}")
+    logger.info("Fetching text for request ID: %s", request_id)
     generated_text = await _get_or_generate_text(request_id, state)
     return {"request_id": request_id, "generated_text": generated_text}
 
@@ -481,26 +812,19 @@ async def interrupt_initiated_request(request_id: str) -> dict[str, str | bool]:
 
 
 @app.get("/requests/{request_id}/audio")
-async def stream_initiated_request_audio(request_id: str) -> StreamingResponse:
-    """Stream raw TTS audio bytes for an initiated request.
-
-    Typical HTTP request:
-
-    ```http
-    GET /requests/{request_id}/audio HTTP/1.1
-    Host: 127.0.0.1:8000
-    Accept: audio/wav
-    ```
+async def get_initiated_request_audio(request_id: str) -> Response:
+    """Generate and return the complete TTS audio for an initiated request.
 
     If text generation is still running, this endpoint waits up to 30 seconds for
-    it to finish. The response body is raw audio bytes, suitable for frontend
-    audio playback.
+    it to finish. OmniVoice does not expose true real-time audio streaming, so
+    the response is sent only after generation completes. PCM responses remain
+    compatible with the frontend's 24 kHz PCM player.
     """
     state = pending_requests.get(request_id)
     if state is None:
         raise HTTPException(status_code=404, detail="Unknown request_id.")
     
-    print(f"Streaming audio for request ID: {request_id}")
+    logger.info(f"Generating OmniVoice audio for request ID: {request_id}")
 
     request = state.request
     generated_text = await _get_or_generate_text(
@@ -512,292 +836,288 @@ async def stream_initiated_request_audio(request_id: str) -> StreamingResponse:
         raise HTTPException(status_code=499, detail=CANCELLED_REQUEST_DETAIL)
 
     request_start = perf_counter()
-    tts_payload = _build_tts_payload(generated_text, request)
-
-    client = httpx.AsyncClient(timeout=request.tts_timeout_seconds)
-    tts_request_start = perf_counter()
-    stream_context = client.stream(
-        "POST",
-        f"{VLLM_BASE_URL}/audio/speech",
-        json=tts_payload,
-    )
-
-    try:
-        response = await stream_context.__aenter__()
-        response.raise_for_status()
-    except httpx.HTTPStatusError as exc:
-        error_body = (await exc.response.aread()).decode(errors="replace")
-        await stream_context.__aexit__(type(exc), exc, exc.__traceback__)
-        await client.aclose()
-        raise HTTPException(
-            status_code=exc.response.status_code,
-            detail=error_body,
-        ) from exc
-    except httpx.HTTPError as exc:
-        await client.aclose()
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-    async def audio_chunks() -> AsyncIterator[bytes]:
-        first_chunk_seconds = None
-        chunk_count = 0
-        total_bytes = 0
+    voice_clone_prompt = None
+    if request.clone_voice and request.ref_audio:
+        prompt_task = state.voice_clone_prompt_task
+        if prompt_task is None:
+            prompt_task = asyncio.create_task(
+                _get_or_create_voice_clone_prompt(request.ref_audio)
+            )
+            state.voice_clone_prompt_task = prompt_task
 
         try:
-            async for chunk in response.aiter_bytes(chunk_size=request.audio_chunk_size):
-                if state.cancelled:
-                    logger.info(
-                        "initiated audio stream interrupted: request_id=%s",
-                        request_id,
-                    )
-                    break
-
-                if chunk:
-                    print(f"Received audio chunk of size {len(chunk)} bytes for request ID: {request_id}")
-                    now = perf_counter()
-                    chunk_count += 1
-                    total_bytes += len(chunk)
-
-                    if first_chunk_seconds is None:
-                        first_chunk_seconds = now - tts_request_start
-                        logger.info(
-                            "initiated stream first audio chunk: %.3fs after TTS request "
-                            "(request_id=%s)",
-                            first_chunk_seconds,
-                            request_id,
-                        )
-
-                    print(f"Yielding audio chunk of size {len(chunk)} bytes for request ID: {request_id}")
-                    yield chunk
-        except httpx.RemoteProtocolError:
+            voice_clone_prompt = await asyncio.shield(prompt_task)
+        except HTTPException:
+            raise
+        except Exception as exc:
             logger.exception(
-                "upstream TTS stream ended with an incomplete chunked response: "
-                "request_id=%s chunks=%s bytes=%s",
+                "VoiceClonePrompt preparation failed: request_id=%s",
                 request_id,
-                chunk_count,
-                total_bytes,
             )
-        finally:
-            total_seconds = perf_counter() - request_start
-            logger.info(
-                "initiated audio stream completed: request_id=%s chunks=%s bytes=%s "
-                "total=%.3fs first_tts_chunk=%.3fs",
-                request_id,
-                chunk_count,
-                total_bytes,
-                total_seconds,
-                first_chunk_seconds or -1,
-            )
-            await stream_context.__aexit__(None, None, None)
-            print(f"Closing HTTP client for request ID: {request_id}")
-            await client.aclose()
+            raise HTTPException(
+                status_code=502,
+                detail=f"Voice clone preparation failed: {exc}",
+            ) from exc
 
-    return StreamingResponse(
-        audio_chunks(),
-        media_type=_content_type_for_audio_format(request.response_format),
-    )
+    if state.cancelled:
+        raise HTTPException(status_code=499, detail=CANCELLED_REQUEST_DETAIL)
 
-
-@app.post("/stream-tts")
-async def stream_tts(request: StreamTTSRequest) -> StreamingResponse:
-    """Generate text with Ollama, then stream generated TTS audio from vLLM.
-
-    Typical HTTP request:
-
-    ```http
-    POST /stream-tts HTTP/1.1
-    Host: 127.0.0.1:8000
-    Content-Type: application/json
-    Accept: audio/wav
-
-    {
-      "prompt": "Greet the user in one friendly sentence.",
-      "voice": "casual_male",
-      "response_format": "wav"
-    }
-    ```
-
-    The endpoint waits until Ollama finishes the text response, sends that text
-    to `/v1/audio/speech`, then forwards audio bytes as chunks. If the vLLM
-    server streams audio incrementally, the client receives those chunks as they
-    arrive; otherwise the bytes are forwarded as soon as vLLM returns them.
-
-    To validate streaming behavior without saving audio, call
-    `/stream-tts/diagnostics` with the same request body.
-    """
-    request_start = perf_counter()
-    text_response = await _generate_ollama_chat_response(
+    tts_payload = _build_tts_payload(
+        generated_text,
         request,
-        timeout_seconds=request.text_generation_timeout_seconds,
+        voice_clone_prompt,
     )
-    print(f"Text response: {text_response}")
-    text_generation_seconds = perf_counter() - request_start
-    generated_text = _extract_ollama_response_text(text_response)
-    tts_payload = _build_tts_payload(generated_text, request)
-
-    client = httpx.AsyncClient(timeout=request.tts_timeout_seconds)
-    tts_request_start = perf_counter()
-    stream_context = client.stream(
-        "POST",
-        f"{VLLM_BASE_URL}/audio/speech",
-        json=tts_payload,
-    )
-
-    try:
-        response = await stream_context.__aenter__()
-        response.raise_for_status()
-    except httpx.HTTPStatusError as exc:
-        error_body = (await exc.response.aread()).decode(errors="replace")
-        await stream_context.__aexit__(type(exc), exc, exc.__traceback__)
-        await client.aclose()
-        raise HTTPException(
-            status_code=exc.response.status_code,
-            detail=error_body,
-        ) from exc
-    except httpx.HTTPError as exc:
-        await client.aclose()
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-    async def audio_chunks() -> AsyncIterator[bytes]:
-        first_chunk_seconds = None
-        chunk_count = 0
-        total_bytes = 0
-
-        try:
-            async for chunk in response.aiter_bytes(chunk_size=request.audio_chunk_size):
-                if chunk:
-                    now = perf_counter()
-                    chunk_count += 1
-                    total_bytes += len(chunk)
-
-                    if first_chunk_seconds is None:
-                        first_chunk_seconds = now - tts_request_start
-                        logger.info(
-                            "stream-tts first audio chunk: %.3fs after TTS request "
-                            "(%.3fs after original request); text generation took %.3fs",
-                            first_chunk_seconds,
-                            now - request_start,
-                            text_generation_seconds,
-                        )
-
-                    yield chunk
-        except httpx.RemoteProtocolError:
-            logger.exception(
-                "upstream stream-tts response ended incomplete: chunks=%s bytes=%s",
-                chunk_count,
-                total_bytes,
-            )
-        finally:
-            total_seconds = perf_counter() - request_start
-            logger.info(
-                "stream-tts completed: chunks=%s bytes=%s total=%.3fs "
-                "first_tts_chunk=%.3fs",
-                chunk_count,
-                total_bytes,
-                total_seconds,
-                first_chunk_seconds or -1,
-            )
-            await stream_context.__aexit__(None, None, None)
-            await client.aclose()
-
-    return StreamingResponse(
-        audio_chunks(),
-        media_type=_content_type_for_audio_format(request.response_format),
-    )
-
-
-@app.post("/stream-tts/diagnostics")
-async def stream_tts_diagnostics(request: StreamTTSRequest) -> dict[str, Any]:
-    """Measure whether vLLM returns TTS audio incrementally.
-
-    Typical HTTP request:
-
-    ```http
-    POST /stream-tts/diagnostics HTTP/1.1
-    Host: 127.0.0.1:8000
-    Content-Type: application/json
-
-    {
-      "prompt": "Write a long spoken answer about healthy sleep habits.",
-      "voice": "casual_male",
-      "response_format": "wav"
-    }
-    ```
-
-    The response is JSON with first-chunk timing, total timing, byte counts, and
-    per-chunk arrival times. If `first_audio_chunk_seconds_since_tts_start` is
-    close to `tts_total_seconds` or `chunk_count` is 1, the upstream TTS server
-    likely buffered the audio before responding.
-    """
-    request_start = perf_counter()
-    text_response = await _generate_ollama_chat_response(
-        request,
-        timeout_seconds=request.text_generation_timeout_seconds,
-    )
-    text_generation_seconds = perf_counter() - request_start
-    generated_text = _extract_ollama_response_text(text_response)
-    tts_payload = _build_tts_payload(generated_text, request)
-
-    chunk_events: list[dict[str, float | int]] = []
-    total_audio_bytes = 0
-    first_audio_chunk_seconds_since_tts_start: float | None = None
 
     tts_request_start = perf_counter()
+    inference_task: asyncio.Task[list[Any]] | None = None
     try:
-        async with httpx.AsyncClient(timeout=request.tts_timeout_seconds) as client:
-            async with client.stream(
-                "POST",
-                f"{VLLM_BASE_URL}/audio/speech",
-                json=tts_payload,
-            ) as response:
-                response.raise_for_status()
-
-                async for chunk in response.aiter_bytes(
-                    chunk_size=request.audio_chunk_size,
-                ):
-                    if not chunk:
-                        continue
-
-                    now = perf_counter()
-                    if first_audio_chunk_seconds_since_tts_start is None:
-                        first_audio_chunk_seconds_since_tts_start = now - tts_request_start
-
-                    total_audio_bytes += len(chunk)
-                    chunk_events.append(
-                        {
-                            "index": len(chunk_events) + 1,
-                            "bytes": len(chunk),
-                            "seconds_since_tts_start": round(now - tts_request_start, 3),
-                            "seconds_since_request_start": round(now - request_start, 3),
-                        }
-                    )
-    except httpx.HTTPStatusError as exc:
+        state.tts_generation_task = asyncio.current_task()
+        async with app.state.tts_lock:
+            inference_task = asyncio.create_task(
+                asyncio.to_thread(app.state.tts_model.generate, **tts_payload)
+            )
+            try:
+                generated_audios = await asyncio.wait_for(
+                    asyncio.shield(inference_task),
+                    timeout=request.tts_timeout_seconds,
+                )
+            except (asyncio.CancelledError, TimeoutError):
+                # PyTorch inference in a worker thread cannot be stopped safely.
+                # Keep the model lock until it finishes so another request does
+                # not run concurrently against the same model.
+                await inference_task
+                raise
+    except TimeoutError as exc:
         raise HTTPException(
-            status_code=exc.response.status_code,
-            detail=exc.response.text,
+            status_code=504,
+            detail="OmniVoice generation timed out.",
         ) from exc
-    except httpx.HTTPError as exc:
+    except asyncio.CancelledError as exc:
+        state.cancelled = True
+        state.error = CANCELLED_REQUEST_DETAIL
+        raise HTTPException(status_code=499, detail=CANCELLED_REQUEST_DETAIL) from exc
+    except Exception as exc:
+        logger.exception("OmniVoice generation failed: request_id=%s", request_id)
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+    finally:
+        state.tts_generation_task = None
 
-    tts_total_seconds = perf_counter() - tts_request_start
+    if state.cancelled:
+        raise HTTPException(status_code=499, detail=CANCELLED_REQUEST_DETAIL)
+
+    if not generated_audios:
+        raise HTTPException(status_code=502, detail="OmniVoice generated no audio.")
+
+    sample_rate = int(app.state.tts_model.sampling_rate)
+    if request.response_format == "pcm" and sample_rate != OMNIVOICE_SAMPLE_RATE:
+        raise HTTPException(
+            status_code=502,
+            detail=f"OmniVoice returned PCM at an unsupported {sample_rate} Hz.",
+        )
+
+    try:
+        audio_bytes = _encode_generated_audio(
+            generated_audios[0],
+            sample_rate,
+            request.response_format,
+        )
+    except (RuntimeError, TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="OmniVoice audio could not be encoded.",
+        ) from exc
+
     total_seconds = perf_counter() - request_start
-    first_chunk_seconds = first_audio_chunk_seconds_since_tts_start
-    likely_streaming = (
-        first_chunk_seconds is not None
-        and len(chunk_events) > 1
-        and first_chunk_seconds + 0.25 < tts_total_seconds
+    logger.info(
+        "OmniVoice audio completed: request_id=%s bytes=%s total=%.3fs tts=%.3fs",
+        request_id,
+        len(audio_bytes),
+        total_seconds,
+        perf_counter() - tts_request_start,
     )
+    return Response(
+        content=audio_bytes,
+        media_type=_content_type_for_audio_format(request.response_format),
+    )
+
+
+@app.post("/pseudo-stream/initiate-request")
+async def initiate_pseudo_stream_request(request: InitiateRequest) -> dict[str, str]:
+    """Start the isolated streaming-text/pseudo-streaming-audio pipeline."""
+    request_id = str(uuid4())
+    state = PseudoStreamRequestState(
+        _stream_request_from_initiate_request(request)
+    )
+    pseudo_stream_requests[request_id] = state
+
+    if state.request.clone_voice and state.request.ref_audio:
+        prompt_task = asyncio.create_task(
+            _get_or_create_voice_clone_prompt(state.request.ref_audio)
+        )
+        state.voice_clone_prompt_task = prompt_task
+        prompt_task.add_done_callback(
+            lambda task: _log_voice_clone_prompt_result(request_id, task)
+        )
+
+    state.text_generation_task = asyncio.create_task(
+        _run_pseudo_text_pipeline(request_id, state)
+    )
+    logger.info("Initiated pseudo-stream request: request_id=%s", request_id)
+    return {"request_id": request_id}
+
+
+@app.get("/pseudo-stream/requests/{request_id}/text")
+async def get_pseudo_stream_text(request_id: str) -> dict[str, str]:
+    state = pseudo_stream_requests.get(request_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="Unknown request_id.")
+
+    await state.text_ready.wait()
+    if state.error is not None:
+        status_code = 499 if state.cancelled else 502
+        raise HTTPException(status_code=status_code, detail=state.error)
+    if state.generated_text is None:
+        raise HTTPException(status_code=502, detail="Text generation failed.")
 
     return {
-        "likely_streaming": likely_streaming,
-        "text_generation_seconds": round(text_generation_seconds, 3),
-        "first_audio_chunk_seconds_since_tts_start": (
-            round(first_chunk_seconds, 3) if first_chunk_seconds is not None else None
-        ),
-        "tts_total_seconds": round(tts_total_seconds, 3),
-        "total_seconds": round(total_seconds, 3),
-        "chunk_count": len(chunk_events),
-        "total_audio_bytes": total_audio_bytes,
-        "audio_chunk_size": request.audio_chunk_size,
-        "generated_text": generated_text,
-        "chunk_events": chunk_events,
+        "request_id": request_id,
+        "generated_text": state.generated_text,
     }
+
+
+@app.post("/pseudo-stream/requests/{request_id}/interrupt")
+async def interrupt_pseudo_stream_request(
+    request_id: str,
+) -> dict[str, str | bool]:
+    state = pseudo_stream_requests.get(request_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="Unknown request_id.")
+
+    state.cancelled = True
+    state.error = CANCELLED_REQUEST_DETAIL
+    state.text_ready.set()
+
+    text_task_cancelled = False
+    if (
+        state.text_generation_task is not None
+        and not state.text_generation_task.done()
+    ):
+        state.text_generation_task.cancel()
+        text_task_cancelled = True
+
+    tts_task_cancelled = False
+    if state.tts_generation_task is not None and not state.tts_generation_task.done():
+        state.tts_generation_task.cancel()
+        tts_task_cancelled = True
+
+    logger.info(
+        "Interrupted pseudo-stream request: request_id=%s "
+        "text_task_cancelled=%s tts_task_cancelled=%s",
+        request_id,
+        text_task_cancelled,
+        tts_task_cancelled,
+    )
+    return {
+        "interrupted": True,
+        "request_id": request_id,
+        "text_generation_task_cancelled": text_task_cancelled,
+        "tts_generation_task_cancelled": tts_task_cancelled,
+    }
+
+
+@app.get("/pseudo-stream/requests/{request_id}/audio")
+async def stream_pseudo_stream_audio(request_id: str) -> StreamingResponse:
+    state = pseudo_stream_requests.get(request_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="Unknown request_id.")
+    if state.audio_started:
+        raise HTTPException(
+            status_code=409,
+            detail="Audio streaming has already started for this request.",
+        )
+    if state.request.response_format != "pcm":
+        raise HTTPException(
+            status_code=422,
+            detail="Pseudo-streaming currently requires PCM output.",
+        )
+    state.audio_started = True
+
+    first_text = await state.sentence_queue.get()
+    if first_text is None:
+        if state.error is not None:
+            status_code = 499 if state.cancelled else 502
+            raise HTTPException(status_code=status_code, detail=state.error)
+        raise HTTPException(
+            status_code=502,
+            detail="Ollama completed without text for speech generation.",
+        )
+
+    voice_clone_prompt = None
+    if state.request.clone_voice and state.request.ref_audio:
+        prompt_task = state.voice_clone_prompt_task
+        if prompt_task is None:
+            prompt_task = asyncio.create_task(
+                _get_or_create_voice_clone_prompt(state.request.ref_audio)
+            )
+            state.voice_clone_prompt_task = prompt_task
+        try:
+            voice_clone_prompt = await asyncio.shield(prompt_task)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Voice clone preparation failed: {exc}",
+            ) from exc
+
+    if state.cancelled:
+        raise HTTPException(status_code=499, detail=CANCELLED_REQUEST_DETAIL)
+
+    async def audio_chunks() -> AsyncIterator[bytes]:
+        next_text: str | None = first_text
+        chunk_count = 0
+        stream_start = perf_counter()
+        state.tts_generation_task = asyncio.current_task()
+
+        try:
+            while next_text is not None:
+                if state.cancelled:
+                    break
+
+                audio_bytes = await _generate_pseudo_stream_audio(
+                    next_text,
+                    state.request,
+                    voice_clone_prompt,
+                )
+                chunk_count += 1
+                logger.info(
+                    "Yielding pseudo-stream audio chunk: request_id=%s "
+                    "chunk=%s bytes=%s",
+                    request_id,
+                    chunk_count,
+                    len(audio_bytes),
+                )
+                yield audio_bytes
+                next_text = await state.sentence_queue.get()
+
+            if state.error is not None and not state.cancelled:
+                raise RuntimeError(state.error)
+        except asyncio.CancelledError:
+            state.cancelled = True
+            state.error = CANCELLED_REQUEST_DETAIL
+        except Exception:
+            logger.exception(
+                "Pseudo-stream audio failed: request_id=%s",
+                request_id,
+            )
+            raise
+        finally:
+            state.tts_generation_task = None
+            logger.info(
+                "Pseudo-stream audio finished: request_id=%s chunks=%s total=%.3fs",
+                request_id,
+                chunk_count,
+                perf_counter() - stream_start,
+            )
+
+    return StreamingResponse(audio_chunks(), media_type="audio/pcm")

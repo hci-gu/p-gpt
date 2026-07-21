@@ -1,12 +1,16 @@
 import { AppSidebar } from '@/components/app-sidebar'
-import { SidebarProvider, SidebarTrigger } from '@/components/ui/sidebar'
+import { AuthScreen } from '@/components/auth-screen'
+import { SidebarProvider } from '@/components/ui/sidebar'
+import { Spinner } from '@/components/ui/spinner'
+import { backgroundOptions } from '@/lib/backgrounds'
+import { useAuthStore } from '@/src/state/auth'
+import { usePreferencesStore } from '@/src/state/preferences'
+import { useEffect } from 'react'
 import type { CSSProperties } from 'react'
-import backgroundImageUrl from '../assets/background.png'
 import ChatPage from './pages/Chat'
 
 const backgroundTuning = {
   chatSurfaceOpacity: 0.66,
-  headerSurfaceOpacity: 0.72,
   imageOpacity: 0.86,
   overlayOpacity: 0.28,
   promptInputSurfaceOpacity: 0.88,
@@ -14,59 +18,68 @@ const backgroundTuning = {
 
 const backgroundStyle = {
   '--chat-surface-opacity': backgroundTuning.chatSurfaceOpacity,
-  '--header-surface-opacity': backgroundTuning.headerSurfaceOpacity,
   '--image-opacity': backgroundTuning.imageOpacity,
   '--overlay-opacity': backgroundTuning.overlayOpacity,
   '--prompt-input-surface-opacity': backgroundTuning.promptInputSurfaceOpacity,
 } as CSSProperties
 
 function App() {
+  const authStatus = useAuthStore((state) => state.status)
+  const initializeAuth = useAuthStore((state) => state.initialize)
+  const user = useAuthStore((state) => state.user)
+  const selectedBackgroundId = usePreferencesStore(
+    (state) => state.selectedBackgroundId
+  )
+  const selectedBackground = backgroundOptions.find(
+    (option) => option.id === selectedBackgroundId
+  )
+  const backgroundImageUrl = selectedBackground?.url ?? null
+
+  useEffect(() => {
+    void initializeAuth()
+  }, [initializeAuth])
+
+  if (authStatus === 'loading') {
+    return (
+      <main className="flex min-h-screen items-center justify-center bg-background">
+        <Spinner className="size-6" />
+      </main>
+    )
+  }
+
+  if (authStatus === 'anonymous') {
+    return <AuthScreen />
+  }
+
   return (
-    <SidebarProvider>
+    <SidebarProvider key={user?.id}>
       <div
         className="relative isolate flex min-h-screen w-full min-w-0 flex-1 flex-col overflow-hidden bg-background text-foreground"
-        style={backgroundStyle}
+        style={{
+          ...backgroundStyle,
+          backgroundColor: backgroundImageUrl ? undefined : '#fff',
+        }}
       >
-        <div
-          aria-hidden="true"
-          className="pointer-events-none absolute inset-0 -z-20 bg-cover bg-center bg-no-repeat"
-          style={{
-            backgroundImage: `url(${backgroundImageUrl})`,
-            opacity: 'var(--image-opacity)',
-          }}
-        />
-        <div
-          aria-hidden="true"
-          className="pointer-events-none absolute inset-0 -z-10 bg-background"
-          style={{ opacity: 'var(--overlay-opacity)' }}
-        />
-        <header
-          className="relative z-20 border-b backdrop-blur-md"
-          style={{
-            backgroundColor: 'hsl(0 0% 100% / var(--header-surface-opacity))',
-          }}
-        >
-          <nav className="mx-auto flex h-14 w-full max-w-6xl items-center justify-between px-4 sm:px-6 lg:px-8">
-            <div className="flex min-w-0 items-center gap-3">
-              <SidebarTrigger className="-ml-1" />
-              <a className="truncate font-semibold tracking-tight" href="/">
-                P-GPT
-              </a>
-            </div>
-            <div className="flex items-center gap-4 text-sm text-muted-foreground">
-              <a className="transition-colors hover:text-foreground" href="/">
-                Chat
-              </a>
-              <a className="transition-colors hover:text-foreground" href="/">
-                Docs
-              </a>
-            </div>
-          </nav>
-        </header>
-
+        {backgroundImageUrl && (
+          <>
+            <div
+              aria-hidden="true"
+              className="pointer-events-none absolute inset-0 -z-20 bg-cover bg-center bg-no-repeat"
+              style={{
+                backgroundImage: `url(${backgroundImageUrl})`,
+                opacity: 'var(--image-opacity)',
+              }}
+            />
+            <div
+              aria-hidden="true"
+              className="pointer-events-none absolute inset-0 -z-10 bg-background"
+              style={{ opacity: 'var(--overlay-opacity)' }}
+            />
+          </>
+        )}
         <div className="flex min-h-0 flex-1">
-          <AppSidebar className="!top-14 !bottom-auto !h-[calc(100svh-3.5rem)]" />
-          <main className="mx-auto flex h-[calc(100vh-3.5rem)] w-full max-w-6xl flex-col px-4 py-6 sm:px-6 lg:px-8">
+          <AppSidebar />
+          <main className="mx-auto flex h-screen w-full max-w-6xl flex-col px-4 py-6 sm:px-6 lg:px-8">
             <section
               className="chat-shell min-h-0 flex-1 overflow-hidden rounded-lg border shadow-sm backdrop-blur-sm"
               style={{
