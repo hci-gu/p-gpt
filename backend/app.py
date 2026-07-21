@@ -89,7 +89,10 @@ OLLAMA_TEXT_MODEL = settings.ollama_text_model
 
 OMNIVOICE_TTS_MODEL = settings.tts_model
 OMNIVOICE_SAMPLE_RATE = 24_000
-POCKETBASE_BASE_URL = os.getenv("POCKETBASE_BASE_URL", "http://127.0.0.1:8090").rstrip("/")
+POCKETBASE_BASE_URL = os.getenv(
+    "POCKETBASE_BASE_URL",
+    settings.pocketbase_base_url,
+).rstrip("/")
 
 
 class ChatMessage(BaseModel):
@@ -253,20 +256,36 @@ def _extract_ollama_response_text(response_data: dict[str, Any]) -> str:
 async def _prepare_reference_audio(ref_audio: str) -> tuple[torch.Tensor, int]:
     parsed_reference = urlparse(ref_audio)
     parsed_pocketbase = urlparse(POCKETBASE_BASE_URL)
-    is_pocketbase_file = (
-        parsed_reference.scheme == parsed_pocketbase.scheme
-        and parsed_reference.netloc == parsed_pocketbase.netloc
+    is_pocketbase_file_path = (
+        parsed_reference.scheme in {"http", "https"}
+        and bool(parsed_reference.netloc)
         and parsed_reference.path.startswith("/api/files/")
     )
-    if not is_pocketbase_file:
+    if not is_pocketbase_file_path:
         raise HTTPException(
             status_code=422,
             detail="Voice reference must be a PocketBase file URL.",
         )
 
+    # The frontend uses PocketBase's externally reachable address, while the
+    # backend can fetch the same file over loopback. Rebuild the URL against the
+    # configured local origin instead of trusting or requesting the supplied
+    # host, which also keeps this endpoint from becoming an SSRF proxy.
+    local_reference_url = parsed_pocketbase._replace(
+        path=parsed_reference.path,
+        params="",
+        query=parsed_reference.query,
+        fragment="",
+    ).geturl()
+    logger.info(
+        "Loading voice reference from PocketBase: supplied=%s local=%s",
+        ref_audio,
+        local_reference_url,
+    )
+
     try:
         async with httpx.AsyncClient(timeout=20, follow_redirects=False) as client:
-            response = await client.get(ref_audio)
+            response = await client.get(local_reference_url)
             response.raise_for_status()
     except httpx.HTTPStatusError as exc:
         raise HTTPException(
