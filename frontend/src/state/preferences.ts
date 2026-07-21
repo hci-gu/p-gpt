@@ -8,6 +8,7 @@ export type GenerationParameters = {
   temperature: number
   cloneVoice: boolean
   maxNewTokens: number
+  streaming: boolean
   ttsStepLevel: number
   repeatPenalty: 1 | 1.1 | 1.2
   seed: number | null
@@ -20,6 +21,7 @@ export const defaultGenerationParameters: GenerationParameters = {
   temperature: 1,
   cloneVoice: true,
   maxNewTokens: 256,
+  streaming: false,
   ttsStepLevel: 5,
   repeatPenalty: 1,
   seed: null,
@@ -65,6 +67,10 @@ const getInitialGenerationParameters = (): GenerationParameters => {
       'maxNewTokens' in parsed && typeof parsed.maxNewTokens === 'number'
         ? Math.min(8192, Math.max(64, Math.round(parsed.maxNewTokens)))
         : defaultGenerationParameters.maxNewTokens
+    const streaming =
+      'streaming' in parsed && typeof parsed.streaming === 'boolean'
+        ? parsed.streaming
+        : defaultGenerationParameters.streaming
     const ttsStepLevel =
       'ttsStepLevel' in parsed && typeof parsed.ttsStepLevel === 'number'
         ? Math.min(10, Math.max(1, Math.round(parsed.ttsStepLevel)))
@@ -88,6 +94,7 @@ const getInitialGenerationParameters = (): GenerationParameters => {
       maxNewTokens,
       repeatPenalty,
       seed,
+      streaming,
       temperature,
       ttsStepLevel,
     }

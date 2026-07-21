@@ -14,13 +14,16 @@ import {
 } from '@/src/state/preferences'
 
 const apiEndpoint = import.meta.env.VITE_API_ENDPOINT ?? "http://127.0.0.1:8000" // default-value local API, otherwise try to reach URL specified in .env
-const chatInitializeEndpoint = `${apiEndpoint}/initiate-request`
-const chatTextEndpoint = (chatId: string) =>
-  `${apiEndpoint}/requests/${chatId}/text`
-const chatTtsStreamEndpoint = (chatId: string) =>
-  `${apiEndpoint}/requests/${chatId}/audio`
-const chatInterruptEndpoint = (chatId: string) =>
-  `${apiEndpoint}/requests/${chatId}/interrupt`
+const requestApiEndpoint = (streaming: boolean) =>
+  streaming ? `${apiEndpoint}/pseudo-stream` : apiEndpoint
+const chatInitializeEndpoint = (streaming: boolean) =>
+  `${requestApiEndpoint(streaming)}/initiate-request`
+const chatTextEndpoint = (chatId: string, streaming: boolean) =>
+  `${requestApiEndpoint(streaming)}/requests/${chatId}/text`
+const chatTtsStreamEndpoint = (chatId: string, streaming: boolean) =>
+  `${requestApiEndpoint(streaming)}/requests/${chatId}/audio`
+const chatInterruptEndpoint = (chatId: string, streaming: boolean) =>
+  `${requestApiEndpoint(streaming)}/requests/${chatId}/interrupt`
 
 export interface MessageType {
   key: string
@@ -78,6 +81,7 @@ type ChatRequestParameters = {
   refAudio?: string
   repeatPenalty: 1 | 1.1 | 1.2
   seed: number | null
+  streaming: boolean
   temperature: number
 }
 
@@ -86,7 +90,7 @@ const initializeChat = async (
   parameters: ChatRequestParameters,
   signal?: AbortSignal
 ) => {
-  const response = await fetch(chatInitializeEndpoint, {
+  const response = await fetch(chatInitializeEndpoint(parameters.streaming), {
     body: JSON.stringify({
       clone_voice: parameters.cloneVoice,
       max_tokens: parameters.maxNewTokens,
@@ -137,8 +141,12 @@ const initializeChat = async (
   throw new Error('Chat initialization response did not include an id.')
 }
 
-const fetchTextResponse = async (chatId: string, signal?: AbortSignal) => {
-  const response = await fetch(chatTextEndpoint(chatId), {
+const fetchTextResponse = async (
+  chatId: string,
+  streaming: boolean,
+  signal?: AbortSignal
+) => {
+  const response = await fetch(chatTextEndpoint(chatId, streaming), {
     headers: {
       Accept: 'application/json, text/plain',
     },
@@ -219,6 +227,7 @@ interface ChatState {
   status: ChatStatus
   activeRequestAbortController: AbortController | null
   activeRequestId: string | null
+  activeRequestStreaming: boolean
   messages: MessageType[]
   streamingMessageId: string | null
   activeHistoryId: string | null
@@ -258,6 +267,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   status: 'ready',
   activeRequestAbortController: null,
   activeRequestId: null,
+  activeRequestStreaming: false,
   messages: initialMessages,
   streamingMessageId: null,
   activeHistoryId: null,
@@ -366,6 +376,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         }),
         activeRequestAbortController: null,
         activeRequestId: null,
+        activeRequestStreaming: false,
         status: 'ready',
         streamingMessageId: null,
       }
@@ -394,20 +405,26 @@ export const useChatStore = create<ChatState>((set, get) => ({
       }),
       activeRequestAbortController: null,
       activeRequestId: null,
+      activeRequestStreaming: false,
       status: 'error',
       streamingMessageId: null,
     }))
     get().persistConversation(toChatHistory(get().messages))
   },
   interruptAssistantResponse: async () => {
-    const { activeRequestAbortController, activeRequestId, streamingMessageId } =
-      get()
+    const {
+      activeRequestAbortController,
+      activeRequestId,
+      activeRequestStreaming,
+      streamingMessageId,
+    } = get()
 
     activeRequestAbortController?.abort()
 
     set((state) => ({
       activeRequestAbortController: null,
       activeRequestId: null,
+      activeRequestStreaming: false,
       messages: streamingMessageId
         ? state.messages.map((msg) => {
             if (msg.versions.some((v) => v.id === streamingMessageId)) {
@@ -439,7 +456,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
 
     try {
-      await fetch(chatInterruptEndpoint(activeRequestId), { method: 'POST' })
+      await fetch(chatInterruptEndpoint(activeRequestId, activeRequestStreaming), {
+        method: 'POST',
+      })
     } catch {
       // The local abort has already restored the UI; backend cleanup is best effort.
     }
@@ -450,6 +469,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     set({
       activeRequestAbortController: abortController,
       activeRequestId: null,
+      activeRequestStreaming: false,
       status: 'streaming',
       streamingMessageId: messageId,
     })
@@ -488,18 +508,25 @@ export const useChatStore = create<ChatState>((set, get) => ({
           refAudio: persona?.audioSampleUrl ?? undefined,
           repeatPenalty: parameters.repeatPenalty,
           seed: parameters.seed,
+          streaming: parameters.streaming,
           temperature: parameters.temperature,
         },
         abortController.signal
       )
       set((state) =>
         state.streamingMessageId === messageId
-          ? { activeRequestId: chatId }
+          ? {
+              activeRequestId: chatId,
+              activeRequestStreaming: parameters.streaming,
+            }
           : state
       )
-      get().updateMessageAudio(messageId, chatTtsStreamEndpoint(chatId))
+      get().updateMessageAudio(
+        messageId,
+        chatTtsStreamEndpoint(chatId, parameters.streaming)
+      )
 
-      void fetchTextResponse(chatId, abortController.signal)
+      void fetchTextResponse(chatId, parameters.streaming, abortController.signal)
         .then((text) => {
           get().updateMessageContent(messageId, text)
         })
@@ -575,6 +602,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
       activeChatKey: createMessageId('chat'),
       activeHistoryId: null,
       activePersonaId: usePersonasStore.getState().selectedPersonaId,
+      activeRequestAbortController: null,
+      activeRequestId: null,
+      activeRequestStreaming: false,
       messages: [],
       status: 'ready',
       streamingMessageId: null,
@@ -587,6 +617,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       activeHistoryId,
       activeRequestAbortController,
       activeRequestId,
+      activeRequestStreaming,
     } = get()
 
     if (activeHistoryId !== recordId) {
@@ -600,6 +631,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       activePersonaId: usePersonasStore.getState().selectedPersonaId,
       activeRequestAbortController: null,
       activeRequestId: null,
+      activeRequestStreaming: false,
       messages: [],
       status: 'ready',
       streamingMessageId: null,
@@ -608,11 +640,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
     })
 
     if (activeRequestId) {
-      void fetch(chatInterruptEndpoint(activeRequestId), { method: 'POST' }).catch(
-        () => {
-          // The deleted chat is already cleared locally; cleanup is best effort.
-        }
-      )
+      void fetch(chatInterruptEndpoint(activeRequestId, activeRequestStreaming), {
+        method: 'POST',
+      }).catch(() => {
+        // The deleted chat is already cleared locally; cleanup is best effort.
+      })
     }
   },
   loadChat: (recordId, conversation, personaId) => {
@@ -628,6 +660,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
       activeChatKey: `history-${recordId}`,
       activeHistoryId: recordId,
       activePersonaId: restoredPersonaId,
+      activeRequestAbortController: null,
+      activeRequestId: null,
+      activeRequestStreaming: false,
       messages: toMessageTypes(conversation),
       status: 'ready',
       streamingMessageId: null,

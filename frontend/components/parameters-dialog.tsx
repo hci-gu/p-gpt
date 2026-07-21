@@ -196,6 +196,23 @@ export function ParametersDialog({
             />
           </section>
 
+          <section className="flex items-center justify-between gap-4 rounded-lg border bg-muted/15 p-4">
+            <div>
+              <h3 className="font-medium">Streaming</h3>
+              <p className="text-muted-foreground">
+                Start speaking after every two completed sentences. This lowers
+                latency, but separate speech chunks may sound less consistent.
+              </p>
+            </div>
+            <Switch
+              aria-label="Use pseudo-streaming speech"
+              checked={parameters.streaming}
+              onCheckedChange={(checked) =>
+                setParameter('streaming', checked)
+              }
+            />
+          </section>
+
           <section className="grid gap-3 rounded-lg border bg-muted/15 p-4">
             <div className="flex items-start justify-between gap-4">
               <div>
@@ -299,7 +316,8 @@ export function ParametersDialog({
                 defaultGenerationParameters.ttsStepLevel &&
               parameters.repeatPenalty ===
                 defaultGenerationParameters.repeatPenalty &&
-              parameters.seed === defaultGenerationParameters.seed
+              parameters.seed === defaultGenerationParameters.seed &&
+              parameters.streaming === defaultGenerationParameters.streaming
             }
             onClick={resetParameters}
             size="sm"
