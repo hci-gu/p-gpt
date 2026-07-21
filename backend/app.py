@@ -29,7 +29,7 @@ async def lifespan(app: FastAPI):
     logger.info(f"Loading in TTS model OmniVoice using device: {device}")
 
     model = OmniVoice.from_pretrained(
-        "k2-fa/OmniVoice",
+        "k2-fsa/OmniVoice",
         device_map=device,
         dtype=torch.bfloat16
     )
