@@ -28,7 +28,7 @@ async def lifespan(app: FastAPI):
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
     logger.info(f"Loading in TTS model OmniVoice using device: {device}")
 
-    model = OmniVoice(
+    model = OmniVoice.from_pretrained(
         "k2-fa/OmniVoice",
         device_map=device,
         dtype=torch.bfloat16
