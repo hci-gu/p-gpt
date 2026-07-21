@@ -28,6 +28,14 @@ func main() {
 		return se.Next()
 	})
 
+	app.OnRecordCreateRequest("chat_history", "personas").BindFunc(func(e *core.RecordRequestEvent) error {
+		if e.Auth != nil && e.Auth.Collection().Id == "_pb_users_auth_" {
+			e.Record.Set("owner", e.Auth.Id)
+		}
+
+		return e.Next()
+	})
+
 	if err := app.Start(); err != nil {
 		log.Fatal(err)
 	}

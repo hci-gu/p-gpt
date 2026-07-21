@@ -248,6 +248,7 @@ interface ChatState {
     history: StoredChatMessage[]
   ) => Promise<void>
   persistConversation: (conversation: StoredChatMessage[]) => void
+  resetForAuthChange: () => void
   startNewChat: () => void
   clearDeletedChat: (recordId: string) => void
   loadChat: (
@@ -595,6 +596,24 @@ export const useChatStore = create<ChatState>((set, get) => ({
           chatSaveChains.delete(activeChatKey)
         }
       })
+  },
+  resetForAuthChange: () => {
+    get().activeRequestAbortController?.abort()
+    chatSaveChains.clear()
+    set({
+      activeChatKey: createMessageId('chat'),
+      activeHistoryId: null,
+      activePersonaId: null,
+      activeRequestAbortController: null,
+      activeRequestId: null,
+      activeRequestStreaming: false,
+      messages: [],
+      status: 'ready',
+      streamingMessageId: null,
+      text: '',
+      transcriptionDraft: null,
+      useWebSearch: false,
+    })
   },
   startNewChat: () => {
     void get().interruptAssistantResponse()

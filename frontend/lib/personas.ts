@@ -19,25 +19,6 @@ export type CreatePersonaInput = {
   audioSample?: File | null
 }
 
-type PocketBaseListResponse = {
-  items?: unknown[]
-  totalPages?: number
-}
-
-const pocketBaseEndpoint = (
-  import.meta.env.VITE_POCKETBASE_ENDPOINT ?? 'http://127.0.0.1:8090'
-).replace(/\/$/, '')
-
-const collectionName = 'personas'
-const recordsEndpoint = `${pocketBaseEndpoint}/api/collections/${collectionName}/records`
-
-const getFileUrl = (recordId: string, filename: string) =>
-  filename
-    ? `${pocketBaseEndpoint}/api/files/${collectionName}/${encodeURIComponent(
-        recordId
-      )}/${encodeURIComponent(filename)}`
-    : null
-
 const parsePersona = (value: unknown): PersonaRecord | null => {
   if (
     typeof value !== 'object' ||
@@ -58,6 +39,7 @@ const parsePersona = (value: unknown): PersonaRecord | null => {
     'audio_sample' in value && typeof value.audio_sample === 'string'
       ? value.audio_sample
       : ''
+  const record = value as unknown as RecordModel
 
   return {
     id: value.id,
@@ -72,9 +54,13 @@ const parsePersona = (value: unknown): PersonaRecord | null => {
         ? value.instruction_prompt
         : '',
     profilePicture,
-    profilePictureUrl: getFileUrl(value.id, profilePicture),
+    profilePictureUrl: profilePicture
+      ? pb.files.getURL(record, profilePicture)
+      : null,
     audioSample,
-    audioSampleUrl: getFileUrl(value.id, audioSample),
+    audioSampleUrl: audioSample
+      ? pb.files.getURL(record, audioSample)
+      : null,
     created:
       'created' in value && typeof value.created === 'string'
         ? value.created
@@ -86,58 +72,18 @@ const parsePersona = (value: unknown): PersonaRecord | null => {
   }
 }
 
-const throwResponseError = async (response: Response) => {
-  let message = `PocketBase request failed with status ${response.status}`
-
-  try {
-    const data: unknown = await response.json()
-    if (
-      typeof data === 'object' &&
-      data !== null &&
-      'message' in data &&
-      typeof data.message === 'string'
-    ) {
-      message = data.message
-    }
-  } catch {
-    // PocketBase may return an empty response body for some failures.
-  }
-
-  throw new Error(message)
-}
-
 export const listPersonas = async (signal?: AbortSignal) => {
-  const personas: PersonaRecord[] = []
-  let page = 1
-  let totalPages = 1
+  const personas = await pb.collection('personas').getFullList({
+    batch: 200,
+    requestKey: null,
+    signal,
+    sort: 'name',
+  })
 
-  do {
-    const query = new URLSearchParams({
-      page: String(page),
-      perPage: '200',
-      sort: 'name',
-    })
-    const response = await fetch(`${recordsEndpoint}?${query}`, {
-      headers: { Accept: 'application/json' },
-      signal,
-    })
-
-    if (!response.ok) {
-      await throwResponseError(response)
-    }
-
-    const data = (await response.json()) as PocketBaseListResponse
-    personas.push(
-      ...(data.items ?? []).flatMap((item) => {
-        const persona = parsePersona(item)
-        return persona ? [persona] : []
-      })
-    )
-    totalPages = data.totalPages ?? 1
-    page += 1
-  } while (page <= totalPages)
-
-  return personas
+  return personas.flatMap((item) => {
+    const persona = parsePersona(item)
+    return persona ? [persona] : []
+  })
 }
 
 export const createPersona = async (input: CreatePersonaInput) => {
@@ -153,20 +99,13 @@ export const createPersona = async (input: CreatePersonaInput) => {
     body.set('audio_sample', input.audioSample)
   }
 
-  const response = await fetch(recordsEndpoint, {
-    body,
-    headers: { Accept: 'application/json' },
-    method: 'POST',
-  })
-
-  if (!response.ok) {
-    await throwResponseError(response)
-  }
-
-  const persona = parsePersona(await response.json())
+  const response = await pb.collection('personas').create(body)
+  const persona = parsePersona(response)
   if (!persona) {
     throw new Error('PocketBase returned an invalid persona record.')
   }
 
   return persona
 }
+import { pb } from '@/lib/pocketbase'
+import type { RecordModel } from 'pocketbase'

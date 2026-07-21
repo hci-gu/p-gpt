@@ -5,6 +5,7 @@ import {
   listChatHistories,
 } from '@/lib/chat-history'
 import { useChatStore } from '@/src/state/chat'
+import { useAuthStore } from '@/src/state/auth'
 import { Button } from '@/components/ui/button'
 import { ParametersDialog } from '@/components/parameters-dialog'
 import { PersonaDialog } from '@/components/persona-dialog'
@@ -41,6 +42,7 @@ import {
   BrainIcon,
   ChevronUpIcon,
   ImageIcon,
+  LogOutIcon,
   MessageSquareIcon,
   PanelLeftCloseIcon,
   PanelLeftOpenIcon,
@@ -75,6 +77,8 @@ export function AppSidebar(props: ComponentProps<typeof Sidebar>) {
   const loadChat = useChatStore((state) => state.loadChat)
   const startNewChat = useChatStore((state) => state.startNewChat)
   const clearDeletedChat = useChatStore((state) => state.clearDeletedChat)
+  const signOut = useAuthStore((state) => state.signOut)
+  const user = useAuthStore((state) => state.user)
   const selectedBackgroundId = usePreferencesStore(
     (state) => state.selectedBackgroundId
   )
@@ -270,6 +274,14 @@ export function AppSidebar(props: ComponentProps<typeof Sidebar>) {
         </SidebarGroup>
       </SidebarContent>
       <SidebarFooter className="border-t border-sidebar-border">
+        <SidebarMenu>
+          <SidebarMenuItem>
+            <SidebarMenuButton onClick={signOut} tooltip="Sign out">
+              <LogOutIcon />
+              <span className="truncate">{user?.email || 'Sign out'}</span>
+            </SidebarMenuButton>
+          </SidebarMenuItem>
+        </SidebarMenu>
         <Collapsible onOpenChange={setIsSettingsOpen} open={isSettingsOpen}>
           <CollapsibleContent>
             <SidebarMenu className="pb-1">

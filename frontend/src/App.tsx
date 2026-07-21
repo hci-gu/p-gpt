@@ -1,7 +1,11 @@
 import { AppSidebar } from '@/components/app-sidebar'
+import { AuthScreen } from '@/components/auth-screen'
 import { SidebarProvider } from '@/components/ui/sidebar'
+import { Spinner } from '@/components/ui/spinner'
 import { backgroundOptions } from '@/lib/backgrounds'
+import { useAuthStore } from '@/src/state/auth'
 import { usePreferencesStore } from '@/src/state/preferences'
+import { useEffect } from 'react'
 import type { CSSProperties } from 'react'
 import ChatPage from './pages/Chat'
 
@@ -20,6 +24,9 @@ const backgroundStyle = {
 } as CSSProperties
 
 function App() {
+  const authStatus = useAuthStore((state) => state.status)
+  const initializeAuth = useAuthStore((state) => state.initialize)
+  const user = useAuthStore((state) => state.user)
   const selectedBackgroundId = usePreferencesStore(
     (state) => state.selectedBackgroundId
   )
@@ -28,8 +35,24 @@ function App() {
   )
   const backgroundImageUrl = selectedBackground?.url ?? null
 
+  useEffect(() => {
+    void initializeAuth()
+  }, [initializeAuth])
+
+  if (authStatus === 'loading') {
+    return (
+      <main className="flex min-h-screen items-center justify-center bg-background">
+        <Spinner className="size-6" />
+      </main>
+    )
+  }
+
+  if (authStatus === 'anonymous') {
+    return <AuthScreen />
+  }
+
   return (
-    <SidebarProvider>
+    <SidebarProvider key={user?.id}>
       <div
         className="relative isolate flex min-h-screen w-full min-w-0 flex-1 flex-col overflow-hidden bg-background text-foreground"
         style={{

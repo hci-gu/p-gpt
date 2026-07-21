@@ -26,6 +26,7 @@ interface PersonasState {
   loadError: string | null
   ensurePersonasLoaded: () => Promise<PersonaRecord[]>
   createPersona: (input: CreatePersonaInput) => Promise<PersonaRecord>
+  resetForAuthChange: () => void
   selectPersona: (personaId: string) => void
 }
 
@@ -88,6 +89,21 @@ export const usePersonasStore = create<PersonasState>((set, get) => ({
     }))
     get().selectPersona(persona.id)
     return persona
+  },
+  resetForAuthChange: () => {
+    personasLoadPromise = null
+    try {
+      window.localStorage.removeItem(personaStorageKey)
+    } catch {
+      // The in-memory state is still cleared when storage is unavailable.
+    }
+    set({
+      personas: [],
+      selectedPersonaId: null,
+      isLoading: false,
+      hasLoaded: false,
+      loadError: null,
+    })
   },
   selectPersona: (personaId) => {
     try {

@@ -12,18 +12,6 @@ export type ChatHistoryRecord = {
   updated: string
 }
 
-type PocketBaseListResponse = {
-  items?: unknown[]
-  page?: number
-  totalPages?: number
-}
-
-const pocketBaseEndpoint = (
-  import.meta.env.VITE_POCKETBASE_ENDPOINT ?? 'http://127.0.0.1:8090'
-).replace(/\/$/, '')
-
-const recordsEndpoint = `${pocketBaseEndpoint}/api/collections/chat_history/records`
-
 export const CHAT_HISTORY_UPDATED_EVENT = 'chat-history-updated'
 
 export const createChatTitle = (conversation: StoredChatMessage[]) => {
@@ -100,85 +88,33 @@ const parseRecord = (value: unknown): ChatHistoryRecord | null => {
   }
 }
 
-const throwResponseError = async (response: Response) => {
-  let message = `PocketBase request failed with status ${response.status}`
-
-  try {
-    const data: unknown = await response.json()
-    if (
-      typeof data === 'object' &&
-      data !== null &&
-      'message' in data &&
-      typeof data.message === 'string'
-    ) {
-      message = data.message
-    }
-  } catch {
-    // PocketBase may return an empty response body for some failures.
-  }
-
-  throw new Error(message)
-}
-
 const notifyChatHistoryUpdated = () => {
   window.dispatchEvent(new Event(CHAT_HISTORY_UPDATED_EVENT))
 }
 
 export const listChatHistories = async (signal?: AbortSignal) => {
-  const records: ChatHistoryRecord[] = []
-  let page = 1
-  let totalPages = 1
+  const records = await pb.collection('chat_history').getFullList({
+    batch: 200,
+    requestKey: null,
+    signal,
+  })
 
-  do {
-    const query = new URLSearchParams({
-      page: String(page),
-      perPage: '200',
-    })
-    const response = await fetch(`${recordsEndpoint}?${query}`, {
-      headers: { Accept: 'application/json' },
-      signal,
-    })
-
-    if (!response.ok) {
-      await throwResponseError(response)
-    }
-
-    const data = (await response.json()) as PocketBaseListResponse
-    records.push(
-      ...(data.items ?? []).flatMap((item) => {
-        const record = parseRecord(item)
-        return record ? [record] : []
-      })
-    )
-    totalPages = data.totalPages ?? 1
-    page += 1
-  } while (page <= totalPages)
-
-  return records
+  return records.flatMap((item) => {
+    const record = parseRecord(item)
+    return record ? [record] : []
+  })
 }
 
 export const createChatHistory = async (
   conversation: StoredChatMessage[],
   personaId: string | null
 ) => {
-  const response = await fetch(recordsEndpoint, {
-    body: JSON.stringify({
-      conversation,
-      persona_id: personaId ?? '',
-      title: createChatTitle(conversation),
-    }),
-    headers: {
-      Accept: 'application/json',
-      'Content-Type': 'application/json',
-    },
-    method: 'POST',
+  const response = await pb.collection('chat_history').create({
+    conversation,
+    persona_id: personaId ?? '',
+    title: createChatTitle(conversation),
   })
-
-  if (!response.ok) {
-    await throwResponseError(response)
-  }
-
-  const record = parseRecord(await response.json())
+  const record = parseRecord(response)
   if (!record) {
     throw new Error('PocketBase returned an invalid chat history record.')
   }
@@ -191,33 +127,17 @@ export const updateChatHistory = async (
   recordId: string,
   conversation: StoredChatMessage[]
 ) => {
-  const response = await fetch(`${recordsEndpoint}/${recordId}`, {
-    body: JSON.stringify({
-      conversation,
-      title: createChatTitle(conversation),
-    }),
-    headers: {
-      Accept: 'application/json',
-      'Content-Type': 'application/json',
-    },
-    method: 'PATCH',
+  await pb.collection('chat_history').update(recordId, {
+    conversation,
+    title: createChatTitle(conversation),
   })
-
-  if (!response.ok) {
-    await throwResponseError(response)
-  }
 
   notifyChatHistoryUpdated()
 }
 
 export const deleteChatHistory = async (recordId: string) => {
-  const response = await fetch(`${recordsEndpoint}/${recordId}`, {
-    method: 'DELETE',
-  })
-
-  if (!response.ok) {
-    await throwResponseError(response)
-  }
+  await pb.collection('chat_history').delete(recordId)
 
   notifyChatHistoryUpdated()
 }
+import { pb } from '@/lib/pocketbase'
