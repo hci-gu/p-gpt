@@ -14,7 +14,7 @@ payload = {
     "input": input_text,
     "model": "k2-fsa/OmniVoice",
     "response_format": FORMAT,
-    "num_step": 16,
+    "num_step": 22,
     "speed": 0.8,
 }
 

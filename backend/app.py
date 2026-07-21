@@ -1,51 +1,63 @@
-from collections.abc import AsyncIterator
 import asyncio
-import base64
+from contextlib import asynccontextmanager
+from io import BytesIO
 import logging
-import torch
-from omnivoice import OmniVoice
 import os
-from time import time
-from time import perf_counter
+from time import perf_counter, time
 from typing import Any, Literal
 from urllib.parse import urlparse
 from uuid import uuid4
-from contextlib import asynccontextmanager
 from config import settings
 
 import httpx
+import soundfile as sf
+import torch
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response
+from omnivoice import OmniVoice
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-
-    # Startup
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    logger.info(f"Loading in TTS model OmniVoice using device: {device}")
+    dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+    logger.info("Loading OmniVoice on %s", device)
 
     model = OmniVoice.from_pretrained(
-        "k2-fsa/OmniVoice",
+        settings.tts_model,
         device_map=device,
-        dtype=torch.bfloat16
+        dtype=dtype,
+        # Persona references do not currently include transcripts, so the ASR
+        # model is required to construct voice-cloning prompts.
+        load_asr=True,
+        asr_device=device,
     )
-    logger.info(f"TTS model is online. Running warmup inference")
-    t = time()
-    model.generate(
-        text="This is a warmup generation feel free to discard this output",
-    )
-    t_tot = time() - t
-    logger.info(f"Warmup infernce took {t_tot:.2f} s")
+    app.state.tts_model = model
+    app.state.tts_lock = asyncio.Lock()
 
-    yield
-    
-    # Shutdown
-    del model
-    logger.info(f"Shutting down application, cleaning up model from GPU")
+    logger.info("OmniVoice is online; running warmup inference")
+    warmup_start = time()
+    await asyncio.to_thread(
+        model.generate,
+        text="This is a warmup generation. Feel free to discard this output.",
+        num_step=22,
+        speed=0.8,
+    )
+    logger.info("OmniVoice warmup took %.2fs", time() - warmup_start)
+
+    try:
+        yield
+    finally:
+        del app.state.tts_model
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        logger.info("OmniVoice shut down and released its model resources")
+
 
 # Define backend application
 app = FastAPI(lifespan=lifespan)
@@ -62,13 +74,11 @@ app.add_middleware(
 pending_requests: dict[str, "RequestState"] = {}
 CANCELLED_REQUEST_DETAIL = "Request interrupted."
 
-INFERENCE_HOST = settings.inference_host # Spark IP
-
 OLLAMA_BASE_URL = settings.ollama_base_url
 OLLAMA_TEXT_MODEL = settings.ollama_text_model
 
-VLLM_BASE_URL = f"http://{INFERENCE_HOST}:8001/v1"
-VLLM_TTS_MODEL = "mistralai/Voxtral-4B-TTS-2603"
+OMNIVOICE_TTS_MODEL = settings.tts_model
+OMNIVOICE_SAMPLE_RATE = 24_000
 POCKETBASE_BASE_URL = os.getenv("POCKETBASE_BASE_URL", "http://127.0.0.1:8090").rstrip("/")
 
 
@@ -92,14 +102,16 @@ class TextGenerationRequest(BaseModel):
 
 
 class StreamTTSRequest(TextGenerationRequest):
-    tts_model: str = VLLM_TTS_MODEL
+    tts_model: str = OMNIVOICE_TTS_MODEL
     response_format: Literal["wav", "mp3", "opus", "aac", "flac", "pcm"] = "wav"
     voice: str = "casual_male"
     clone_voice: bool = True
     ref_audio: str | None = None
     stream_audio: bool = True
+    num_step: int = Field(default=22, gt=0)
+    speed: float = Field(default=0.8, gt=0)
     text_generation_timeout_seconds: float = Field(default=60, gt=0)
-    tts_timeout_seconds: float = Field(default=120, gt=0)
+    tts_timeout_seconds: float = Field(default=300, gt=0)
     audio_chunk_size: int = Field(default=8192, gt=0)
 
 
@@ -113,14 +125,16 @@ class InitiateRequest(BaseModel):
     max_tokens: int = 1024
     think: bool | Literal["low", "medium", "high", "max"] = False
     reasoning_effort: Literal["none", "low", "medium", "high", "max"] | None = None
-    tts_model: str = VLLM_TTS_MODEL
+    tts_model: str = OMNIVOICE_TTS_MODEL
     response_format: Literal["wav", "mp3", "opus", "aac", "flac", "pcm"] = "wav"
     voice: str = "casual_male"
     clone_voice: bool = True
     ref_audio: str | None = None
     stream_audio: bool = True
+    num_step: int = Field(default=22, gt=0)
+    speed: float = Field(default=0.8, gt=0)
     text_generation_timeout_seconds: float = Field(default=60, gt=0)
-    tts_timeout_seconds: float = Field(default=120, gt=0)
+    tts_timeout_seconds: float = Field(default=300, gt=0)
     audio_chunk_size: int = Field(default=8192, gt=0)
 
 
@@ -134,6 +148,7 @@ class RequestState:
         self.text_generation_lock = asyncio.Lock()
         self.text_generation_started = False
         self.text_generation_task: asyncio.Task[Any] | None = None
+        self.tts_generation_task: asyncio.Task[Any] | None = None
 
 
 def _content_type_for_audio_format(response_format: str) -> str:
@@ -224,7 +239,7 @@ def _extract_ollama_response_text(response_data: dict[str, Any]) -> str:
     raise HTTPException(status_code=502, detail=detail)
 
 
-async def _prepare_reference_audio(ref_audio: str) -> str:
+async def _prepare_reference_audio(ref_audio: str) -> tuple[torch.Tensor, int]:
     parsed_reference = urlparse(ref_audio)
     parsed_pocketbase = urlparse(POCKETBASE_BASE_URL)
     is_pocketbase_file = (
@@ -257,33 +272,69 @@ async def _prepare_reference_audio(ref_audio: str) -> str:
     if not content_type.startswith("audio/"):
         raise HTTPException(status_code=422, detail="Persona reference is not audio.")
 
-    encoded_audio = base64.b64encode(response.content).decode("ascii")
-    return f"data:{content_type};base64,{encoded_audio}"
+    try:
+        audio_array, sample_rate = sf.read(
+            BytesIO(response.content),
+            dtype="float32",
+            always_2d=True,
+        )
+    except (RuntimeError, TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=422,
+            detail="Persona reference audio could not be decoded.",
+        ) from exc
+
+    # OmniVoice expects (channels, samples), while soundfile returns
+    # (samples, channels).
+    waveform = torch.from_numpy(audio_array.T.copy())
+    return waveform, sample_rate
 
 
 async def _build_tts_payload(
     generated_text: str, request: StreamTTSRequest
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
-        "input": generated_text,
-        "model": request.tts_model,
-        "response_format": request.response_format,
+        "text": generated_text,
+        "num_step": request.num_step,
+        "speed": request.speed,
     }
     if request.clone_voice and request.ref_audio:
         payload["ref_audio"] = await _prepare_reference_audio(request.ref_audio)
-    else:
-        payload["voice"] = request.voice
-
-    # vLLM-Omni raw audio streaming is reliable for PCM. Some model/format
-    # combinations, including Voxtral WAV in our setup, close chunked responses
-    # mid-body when stream_format=audio is requested. Keep WAV browser-playable
-    # through the stable non-streaming upstream path until the frontend has a
-    # PCM/WebAudio player.
-    if request.stream_audio and request.response_format == "pcm":
-        payload["stream"] = True
-        payload["stream_format"] = "audio"
 
     return payload
+
+
+def _encode_generated_audio(
+    audio_array: Any,
+    sample_rate: int,
+    response_format: str,
+) -> bytes:
+    output = BytesIO()
+    if response_format == "pcm":
+        sf.write(
+            output,
+            audio_array,
+            sample_rate,
+            format="RAW",
+            subtype="PCM_16",
+            endian="LITTLE",
+        )
+    elif response_format == "wav":
+        sf.write(
+            output,
+            audio_array,
+            sample_rate,
+            format="WAV",
+            subtype="PCM_16",
+        )
+    elif response_format == "mp3":
+        sf.write(output, audio_array, sample_rate, format="MP3")
+    else:
+        raise HTTPException(
+            status_code=422,
+            detail="OmniVoice output supports pcm, wav, or mp3.",
+        )
+    return output.getvalue()
 
 
 def _stream_request_from_initiate_request(request: InitiateRequest) -> StreamTTSRequest:
@@ -303,6 +354,8 @@ def _stream_request_from_initiate_request(request: InitiateRequest) -> StreamTTS
         clone_voice=request.clone_voice,
         ref_audio=request.ref_audio,
         stream_audio=request.stream_audio,
+        num_step=request.num_step,
+        speed=request.speed,
         text_generation_timeout_seconds=request.text_generation_timeout_seconds,
         tts_timeout_seconds=request.tts_timeout_seconds,
         audio_chunk_size=request.audio_chunk_size,
@@ -394,22 +447,31 @@ def _interrupt_request_state(request_id: str, state: RequestState) -> dict[str, 
     state.text_ready.set()
 
     task = state.text_generation_task
-    task_cancelled = False
+    text_task_cancelled = False
     if task is not None and not task.done():
         task.cancel()
-        task_cancelled = True
+        text_task_cancelled = True
+
+    tts_task = state.tts_generation_task
+    tts_task_cancelled = False
+    if tts_task is not None and not tts_task.done():
+        tts_task.cancel()
+        tts_task_cancelled = True
 
     logger.info(
-        "interrupted request_id=%s text_generation_started=%s task_cancelled=%s",
+        "interrupted request_id=%s text_generation_started=%s "
+        "text_task_cancelled=%s tts_task_cancelled=%s",
         request_id,
         state.text_generation_started,
-        task_cancelled,
+        text_task_cancelled,
+        tts_task_cancelled,
     )
 
     return {
         "interrupted": True,
         "request_id": request_id,
-        "text_generation_task_cancelled": task_cancelled,
+        "text_generation_task_cancelled": text_task_cancelled,
+        "tts_generation_task_cancelled": tts_task_cancelled,
     }
 
 
@@ -455,18 +517,19 @@ async def interrupt_initiated_request(request_id: str) -> dict[str, str | bool]:
 
 
 @app.get("/requests/{request_id}/audio")
-async def stream_initiated_request_audio(request_id: str) -> StreamingResponse:
-    """Stream raw TTS audio bytes for an initiated request.
+async def get_initiated_request_audio(request_id: str) -> Response:
+    """Generate and return the complete TTS audio for an initiated request.
 
     If text generation is still running, this endpoint waits up to 30 seconds for
-    it to finish. The response body is raw audio bytes, suitable for frontend
-    audio playback.
+    it to finish. OmniVoice does not expose true real-time audio streaming, so
+    the response is sent only after generation completes. PCM responses remain
+    compatible with the frontend's 24 kHz PCM player.
     """
     state = pending_requests.get(request_id)
     if state is None:
         raise HTTPException(status_code=404, detail="Unknown request_id.")
     
-    logger.info(f"Streaming audio for request ID: {request_id}")
+    logger.info(f"Generating OmniVoice audio for request ID: {request_id}")
 
     request = state.request
     generated_text = await _get_or_generate_text(
@@ -480,82 +543,74 @@ async def stream_initiated_request_audio(request_id: str) -> StreamingResponse:
     request_start = perf_counter()
     tts_payload = await _build_tts_payload(generated_text, request)
 
-    client = httpx.AsyncClient(timeout=request.tts_timeout_seconds)
     tts_request_start = perf_counter()
-    stream_context = client.stream(
-        "POST",
-        f"{VLLM_BASE_URL}/audio/speech",
-        json=tts_payload,
-    )
+    inference_task: asyncio.Task[list[Any]] | None = None
+    try:
+        state.tts_generation_task = asyncio.current_task()
+        async with app.state.tts_lock:
+            inference_task = asyncio.create_task(
+                asyncio.to_thread(app.state.tts_model.generate, **tts_payload)
+            )
+            try:
+                generated_audios = await asyncio.wait_for(
+                    asyncio.shield(inference_task),
+                    timeout=request.tts_timeout_seconds,
+                )
+            except (asyncio.CancelledError, TimeoutError):
+                # PyTorch inference in a worker thread cannot be stopped safely.
+                # Keep the model lock until it finishes so another request does
+                # not run concurrently against the same model.
+                await inference_task
+                raise
+    except TimeoutError as exc:
+        raise HTTPException(
+            status_code=504,
+            detail="OmniVoice generation timed out.",
+        ) from exc
+    except asyncio.CancelledError as exc:
+        state.cancelled = True
+        state.error = CANCELLED_REQUEST_DETAIL
+        raise HTTPException(status_code=499, detail=CANCELLED_REQUEST_DETAIL) from exc
+    except Exception as exc:
+        logger.exception("OmniVoice generation failed: request_id=%s", request_id)
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    finally:
+        state.tts_generation_task = None
+
+    if state.cancelled:
+        raise HTTPException(status_code=499, detail=CANCELLED_REQUEST_DETAIL)
+
+    if not generated_audios:
+        raise HTTPException(status_code=502, detail="OmniVoice generated no audio.")
+
+    sample_rate = int(app.state.tts_model.sampling_rate)
+    if request.response_format == "pcm" and sample_rate != OMNIVOICE_SAMPLE_RATE:
+        raise HTTPException(
+            status_code=502,
+            detail=f"OmniVoice returned PCM at an unsupported {sample_rate} Hz.",
+        )
 
     try:
-        response = await stream_context.__aenter__()
-        response.raise_for_status()
-    except httpx.HTTPStatusError as exc:
-        error_body = (await exc.response.aread()).decode(errors="replace")
-        await stream_context.__aexit__(type(exc), exc, exc.__traceback__)
-        await client.aclose()
+        audio_bytes = _encode_generated_audio(
+            generated_audios[0],
+            sample_rate,
+            request.response_format,
+        )
+    except (RuntimeError, TypeError, ValueError) as exc:
         raise HTTPException(
-            status_code=exc.response.status_code,
-            detail=error_body,
+            status_code=502,
+            detail="OmniVoice audio could not be encoded.",
         ) from exc
-    except httpx.HTTPError as exc:
-        await client.aclose()
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-    async def audio_chunks() -> AsyncIterator[bytes]:
-        first_chunk_seconds = None
-        chunk_count = 0
-        total_bytes = 0
-
-        try:
-            async for chunk in response.aiter_bytes(chunk_size=request.audio_chunk_size):
-                if state.cancelled:
-                    logger.info(
-                        "initiated audio stream interrupted: request_id=%s",
-                        request_id,
-                    )
-                    break
-
-                if chunk:
-                    now = perf_counter()
-                    chunk_count += 1
-                    total_bytes += len(chunk)
-
-                    if first_chunk_seconds is None:
-                        first_chunk_seconds = now - tts_request_start
-                        logger.info(
-                            "initiated stream first audio chunk: %.3fs after TTS request "
-                            "(request_id=%s)",
-                            first_chunk_seconds,
-                            request_id,
-                        )
-
-                    yield chunk
-        except httpx.RemoteProtocolError:
-            logger.exception(
-                "upstream TTS stream ended with an incomplete chunked response: "
-                "request_id=%s chunks=%s bytes=%s",
-                request_id,
-                chunk_count,
-                total_bytes,
-            )
-        finally:
-            total_seconds = perf_counter() - request_start
-            logger.info(
-                "initiated audio stream completed: request_id=%s chunks=%s bytes=%s "
-                "total=%.3fs first_tts_chunk=%.3fs",
-                request_id,
-                chunk_count,
-                total_bytes,
-                total_seconds,
-                first_chunk_seconds or -1,
-            )
-            await stream_context.__aexit__(None, None, None)
-            print(f"Closing HTTP client for request ID: {request_id}")
-            await client.aclose()
-
-    return StreamingResponse(
-        audio_chunks(),
+    total_seconds = perf_counter() - request_start
+    logger.info(
+        "OmniVoice audio completed: request_id=%s bytes=%s total=%.3fs tts=%.3fs",
+        request_id,
+        len(audio_bytes),
+        total_seconds,
+        perf_counter() - tts_request_start,
+    )
+    return Response(
+        content=audio_bytes,
         media_type=_content_type_for_audio_format(request.response_format),
     )
