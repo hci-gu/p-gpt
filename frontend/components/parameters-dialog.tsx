@@ -18,6 +18,7 @@ import { Slider } from '@/components/ui/slider'
 import { Switch } from '@/components/ui/switch'
 import {
   defaultGenerationParameters,
+  omnivoiceNumStepsFromLevel,
   usePreferencesStore,
 } from '@/src/state/preferences'
 
@@ -198,6 +199,38 @@ export function ParametersDialog({
           <section className="grid gap-3 rounded-lg border bg-muted/15 p-4">
             <div className="flex items-start justify-between gap-4">
               <div>
+                <h3 className="font-medium">TTS generation steps</h3>
+                <p className="text-muted-foreground">
+                  Controls OmniVoice&apos;s denoising effort. Higher values can
+                  improve speech quality, but take longer to generate.
+                </p>
+              </div>
+              <output className="min-w-20 rounded-md border bg-background px-2 py-1 text-center font-mono tabular-nums">
+                {parameters.ttsStepLevel} / 10
+                <span className="block text-[10px] text-muted-foreground">
+                  {omnivoiceNumStepsFromLevel(parameters.ttsStepLevel)} steps
+                </span>
+              </output>
+            </div>
+            <Slider
+              aria-label="TTS generation steps"
+              max={10}
+              min={1}
+              onValueChange={([value]) =>
+                setParameter('ttsStepLevel', Math.round(value))
+              }
+              step={1}
+              value={[parameters.ttsStepLevel]}
+            />
+            <div className="flex justify-between text-[10px] text-muted-foreground">
+              <span>Faster · 1</span>
+              <span>Higher quality · 10</span>
+            </div>
+          </section>
+
+          <section className="grid gap-3 rounded-lg border bg-muted/15 p-4">
+            <div className="flex items-start justify-between gap-4">
+              <div>
                 <h3 className="font-medium">Maximum new tokens</h3>
                 <p className="text-muted-foreground">
                   Sets the response-length ceiling on a logarithmic scale.
@@ -262,6 +295,8 @@ export function ParametersDialog({
               parameters.cloneVoice === defaultGenerationParameters.cloneVoice &&
               parameters.maxNewTokens ===
                 defaultGenerationParameters.maxNewTokens &&
+              parameters.ttsStepLevel ===
+                defaultGenerationParameters.ttsStepLevel &&
               parameters.repeatPenalty ===
                 defaultGenerationParameters.repeatPenalty &&
               parameters.seed === defaultGenerationParameters.seed

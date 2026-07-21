@@ -8,14 +8,19 @@ export type GenerationParameters = {
   temperature: number
   cloneVoice: boolean
   maxNewTokens: number
+  ttsStepLevel: number
   repeatPenalty: 1 | 1.1 | 1.2
   seed: number | null
 }
+
+export const omnivoiceNumStepsFromLevel = (level: number) =>
+  Math.round(22 + ((Math.min(10, Math.max(1, level)) - 1) * 10) / 9)
 
 export const defaultGenerationParameters: GenerationParameters = {
   temperature: 1,
   cloneVoice: true,
   maxNewTokens: 256,
+  ttsStepLevel: 5,
   repeatPenalty: 1,
   seed: null,
 }
@@ -60,6 +65,10 @@ const getInitialGenerationParameters = (): GenerationParameters => {
       'maxNewTokens' in parsed && typeof parsed.maxNewTokens === 'number'
         ? Math.min(8192, Math.max(64, Math.round(parsed.maxNewTokens)))
         : defaultGenerationParameters.maxNewTokens
+    const ttsStepLevel =
+      'ttsStepLevel' in parsed && typeof parsed.ttsStepLevel === 'number'
+        ? Math.min(10, Math.max(1, Math.round(parsed.ttsStepLevel)))
+        : defaultGenerationParameters.ttsStepLevel
     const repeatPenalty =
       'repeatPenalty' in parsed &&
       (parsed.repeatPenalty === 1 ||
@@ -80,6 +89,7 @@ const getInitialGenerationParameters = (): GenerationParameters => {
       repeatPenalty,
       seed,
       temperature,
+      ttsStepLevel,
     }
   } catch {
     return defaultGenerationParameters

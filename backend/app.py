@@ -15,10 +15,13 @@ import torch
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
-from omnivoice import OmniVoice
+from omnivoice import OmniVoice, VoiceClonePrompt
 from pydantic import BaseModel, Field
 
-logger = logging.getLogger(__name__)
+# FastAPI's development runner configures the Uvicorn logger hierarchy rather
+# than the root/module logger. Using a child keeps application INFO messages in
+# the same terminal feed as server startup and request logs.
+logger = logging.getLogger("uvicorn.error.p_gpt")
 
 
 @asynccontextmanager
@@ -38,13 +41,15 @@ async def lifespan(app: FastAPI):
     )
     app.state.tts_model = model
     app.state.tts_lock = asyncio.Lock()
+    app.state.voice_clone_prompts = {}
+    app.state.voice_clone_prompt_tasks = {}
 
     logger.info("OmniVoice is online; running warmup inference")
     warmup_start = time()
     await asyncio.to_thread(
         model.generate,
         text="This is a warmup generation. Feel free to discard this output.",
-        num_step=22,
+        num_step=26,
         speed=0.8,
     )
     logger.info("OmniVoice warmup took %.2fs", time() - warmup_start)
@@ -52,6 +57,11 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        prompt_tasks = list(app.state.voice_clone_prompt_tasks.values())
+        if prompt_tasks:
+            await asyncio.gather(*prompt_tasks, return_exceptions=True)
+        app.state.voice_clone_prompts.clear()
+        app.state.voice_clone_prompt_tasks.clear()
         del app.state.tts_model
         del model
         if torch.cuda.is_available():
@@ -108,7 +118,7 @@ class StreamTTSRequest(TextGenerationRequest):
     clone_voice: bool = True
     ref_audio: str | None = None
     stream_audio: bool = True
-    num_step: int = Field(default=22, gt=0)
+    num_step: int = Field(default=26, gt=0)
     speed: float = Field(default=0.8, gt=0)
     text_generation_timeout_seconds: float = Field(default=60, gt=0)
     tts_timeout_seconds: float = Field(default=300, gt=0)
@@ -131,7 +141,7 @@ class InitiateRequest(BaseModel):
     clone_voice: bool = True
     ref_audio: str | None = None
     stream_audio: bool = True
-    num_step: int = Field(default=22, gt=0)
+    num_step: int = Field(default=26, gt=0)
     speed: float = Field(default=0.8, gt=0)
     text_generation_timeout_seconds: float = Field(default=60, gt=0)
     tts_timeout_seconds: float = Field(default=300, gt=0)
@@ -149,6 +159,7 @@ class RequestState:
         self.text_generation_started = False
         self.text_generation_task: asyncio.Task[Any] | None = None
         self.tts_generation_task: asyncio.Task[Any] | None = None
+        self.voice_clone_prompt_task: asyncio.Task[VoiceClonePrompt] | None = None
 
 
 def _content_type_for_audio_format(response_format: str) -> str:
@@ -203,7 +214,7 @@ async def _generate_ollama_chat_response(
     timeout_seconds: float = 60,
 ) -> dict[str, Any]:
     payload = _build_ollama_chat_payload(request)
-    print(f"Sending request to Ollama: {payload}")
+    logger.info("Sending request to Ollama: %s", payload)
     try:
         async with httpx.AsyncClient(timeout=timeout_seconds) as client:
             response = await client.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload)
@@ -290,16 +301,73 @@ async def _prepare_reference_audio(ref_audio: str) -> tuple[torch.Tensor, int]:
     return waveform, sample_rate
 
 
-async def _build_tts_payload(
-    generated_text: str, request: StreamTTSRequest
+async def _create_voice_clone_prompt(ref_audio: str) -> VoiceClonePrompt:
+    reference_audio = await _prepare_reference_audio(ref_audio)
+    prompt_start = perf_counter()
+    logger.info("Creating VoiceClonePrompt for %s", ref_audio)
+
+    async with app.state.tts_lock:
+        prompt = await asyncio.to_thread(
+            app.state.tts_model.create_voice_clone_prompt,
+            ref_audio=reference_audio,
+        )
+
+    logger.info(
+        "VoiceClonePrompt created for %s in %.3fs",
+        ref_audio,
+        perf_counter() - prompt_start,
+    )
+    return prompt
+
+
+async def _get_or_create_voice_clone_prompt(ref_audio: str) -> VoiceClonePrompt:
+    cached_prompt = app.state.voice_clone_prompts.get(ref_audio)
+    if cached_prompt is not None:
+        logger.info("Using cached VoiceClonePrompt for %s", ref_audio)
+        return cached_prompt
+
+    prompt_task = app.state.voice_clone_prompt_tasks.get(ref_audio)
+    if prompt_task is None:
+        prompt_task = asyncio.create_task(_create_voice_clone_prompt(ref_audio))
+        app.state.voice_clone_prompt_tasks[ref_audio] = prompt_task
+
+    try:
+        prompt = await asyncio.shield(prompt_task)
+    finally:
+        if prompt_task.done():
+            app.state.voice_clone_prompt_tasks.pop(ref_audio, None)
+
+    app.state.voice_clone_prompts[ref_audio] = prompt
+    return prompt
+
+
+def _log_voice_clone_prompt_result(
+    request_id: str,
+    task: asyncio.Task[VoiceClonePrompt],
+) -> None:
+    if task.cancelled():
+        return
+    exception = task.exception()
+    if exception is not None:
+        logger.error(
+            "VoiceClonePrompt preparation failed: request_id=%s",
+            request_id,
+            exc_info=(type(exception), exception, exception.__traceback__),
+        )
+
+
+def _build_tts_payload(
+    generated_text: str,
+    request: StreamTTSRequest,
+    voice_clone_prompt: VoiceClonePrompt | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "text": generated_text,
         "num_step": request.num_step,
         "speed": request.speed,
     }
-    if request.clone_voice and request.ref_audio:
-        payload["ref_audio"] = await _prepare_reference_audio(request.ref_audio)
+    if voice_clone_prompt is not None:
+        payload["voice_clone_prompt"] = voice_clone_prompt
 
     return payload
 
@@ -485,7 +553,18 @@ async def initiate_request(request: InitiateRequest) -> dict[str, str]:
     """
     request_id = str(uuid4())
     logger.info(f"Initiating request with ID: {request_id}")
-    pending_requests[request_id] = RequestState(_stream_request_from_initiate_request(request))
+    state = RequestState(_stream_request_from_initiate_request(request))
+    pending_requests[request_id] = state
+
+    if state.request.clone_voice and state.request.ref_audio:
+        prompt_task = asyncio.create_task(
+            _get_or_create_voice_clone_prompt(state.request.ref_audio)
+        )
+        state.voice_clone_prompt_task = prompt_task
+        prompt_task.add_done_callback(
+            lambda task: _log_voice_clone_prompt_result(request_id, task)
+        )
+
     return {"request_id": request_id}
 
 
@@ -501,7 +580,7 @@ async def get_initiated_request_text(request_id: str) -> dict[str, Any]:
     if state is None:
         raise HTTPException(status_code=404, detail="Unknown request_id.")
 
-    print(f"Fetching text for request ID: {request_id}")
+    logger.info("Fetching text for request ID: %s", request_id)
     generated_text = await _get_or_generate_text(request_id, state)
     return {"request_id": request_id, "generated_text": generated_text}
 
@@ -541,7 +620,37 @@ async def get_initiated_request_audio(request_id: str) -> Response:
         raise HTTPException(status_code=499, detail=CANCELLED_REQUEST_DETAIL)
 
     request_start = perf_counter()
-    tts_payload = await _build_tts_payload(generated_text, request)
+    voice_clone_prompt = None
+    if request.clone_voice and request.ref_audio:
+        prompt_task = state.voice_clone_prompt_task
+        if prompt_task is None:
+            prompt_task = asyncio.create_task(
+                _get_or_create_voice_clone_prompt(request.ref_audio)
+            )
+            state.voice_clone_prompt_task = prompt_task
+
+        try:
+            voice_clone_prompt = await asyncio.shield(prompt_task)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.exception(
+                "VoiceClonePrompt preparation failed: request_id=%s",
+                request_id,
+            )
+            raise HTTPException(
+                status_code=502,
+                detail=f"Voice clone preparation failed: {exc}",
+            ) from exc
+
+    if state.cancelled:
+        raise HTTPException(status_code=499, detail=CANCELLED_REQUEST_DETAIL)
+
+    tts_payload = _build_tts_payload(
+        generated_text,
+        request,
+        voice_clone_prompt,
+    )
 
     tts_request_start = perf_counter()
     inference_task: asyncio.Task[list[Any]] | None = None

@@ -8,7 +8,10 @@ import {
   updateChatHistory,
 } from '@/lib/chat-history'
 import { usePersonasStore } from '@/src/state/personas'
-import { usePreferencesStore } from '@/src/state/preferences'
+import {
+  omnivoiceNumStepsFromLevel,
+  usePreferencesStore,
+} from '@/src/state/preferences'
 
 const apiEndpoint = import.meta.env.VITE_API_ENDPOINT ?? "http://127.0.0.1:8000" // default-value local API, otherwise try to reach URL specified in .env
 const chatInitializeEndpoint = `${apiEndpoint}/initiate-request`
@@ -71,6 +74,7 @@ const toChatHistory = (messages: MessageType[]): StoredChatMessage[] =>
 type ChatRequestParameters = {
   cloneVoice: boolean
   maxNewTokens: number
+  numSteps: number
   refAudio?: string
   repeatPenalty: 1 | 1.1 | 1.2
   seed: number | null
@@ -87,6 +91,7 @@ const initializeChat = async (
       clone_voice: parameters.cloneVoice,
       max_tokens: parameters.maxNewTokens,
       messages,
+      num_step: parameters.numSteps,
       ref_audio:
         parameters.cloneVoice && parameters.refAudio
           ? parameters.refAudio
@@ -479,6 +484,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         {
           cloneVoice: parameters.cloneVoice,
           maxNewTokens: parameters.maxNewTokens,
+          numSteps: omnivoiceNumStepsFromLevel(parameters.ttsStepLevel),
           refAudio: persona?.audioSampleUrl ?? undefined,
           repeatPenalty: parameters.repeatPenalty,
           seed: parameters.seed,
