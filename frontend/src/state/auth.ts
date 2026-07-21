@@ -10,8 +10,6 @@ interface AuthState {
   user: RecordModel | null
   status: AuthStatus
   initialize: () => Promise<void>
-  requestPasswordReset: (email: string) => Promise<void>
-  requestVerification: (email: string) => Promise<void>
   signIn: (email: string, password: string) => Promise<void>
   signOut: () => void
   signUp: (
@@ -75,12 +73,6 @@ export const useAuthStore = create<AuthState>((set) => {
 
       await initializationPromise
     },
-    requestPasswordReset: async (email) => {
-      await pb.collection('users').requestPasswordReset(email.trim())
-    },
-    requestVerification: async (email) => {
-      await pb.collection('users').requestVerification(email.trim())
-    },
     signIn: async (email, password) => {
       await pb.collection('users').authWithPassword(email.trim(), password)
     },
@@ -88,12 +80,14 @@ export const useAuthStore = create<AuthState>((set) => {
       pb.authStore.clear()
     },
     signUp: async (email, password, passwordConfirm) => {
+      const identity = email.trim()
       await pb.collection('users').create({
-        email: email.trim(),
+        email: identity,
         emailVisibility: false,
         password,
         passwordConfirm,
       })
+      await pb.collection('users').authWithPassword(identity, password)
     },
   }
 })
