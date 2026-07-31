@@ -16,11 +16,13 @@ import {
 } from '@/components/ui/select'
 import { Slider } from '@/components/ui/slider'
 import { Switch } from '@/components/ui/switch'
+import { listOllamaModels, type OllamaModels } from '@/lib/ollama-models'
 import {
   defaultGenerationParameters,
   omnivoiceNumStepsFromLevel,
   usePreferencesStore,
 } from '@/src/state/preferences'
+import { useEffect, useState } from 'react'
 
 type ParametersDialogProps = {
   open: boolean
@@ -70,6 +72,42 @@ export function ParametersDialog({
   const resetParameters = usePreferencesStore(
     (state) => state.resetGenerationParameters
   )
+  const [ollamaModels, setOllamaModels] = useState<OllamaModels | null>(null)
+  const [modelError, setModelError] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (!open) {
+      return
+    }
+
+    let cancelled = false
+    setModelError(null)
+
+    void listOllamaModels()
+      .then((result) => {
+        if (cancelled) {
+          return
+        }
+
+        setOllamaModels(result)
+        const selectedModel =
+          usePreferencesStore.getState().generationParameters.model
+        if (selectedModel && !result.models.includes(selectedModel)) {
+          setParameter('model', result.defaultModel)
+        }
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) {
+          setModelError(
+            error instanceof Error ? error.message : 'Model discovery failed.'
+          )
+        }
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [open, setParameter])
 
   return (
     <Dialog onOpenChange={onOpenChange} open={open}>
@@ -82,6 +120,43 @@ export function ParametersDialog({
         </DialogHeader>
 
         <div className="grid gap-3">
+          <section className="grid gap-3 rounded-lg border bg-muted/15 p-4">
+            <div>
+              <h3 className="font-medium">Conversation model</h3>
+              <p className="text-muted-foreground">
+                Choose an installed Ollama model for assistant responses.
+              </p>
+            </div>
+            <Select
+              disabled={!ollamaModels}
+              onValueChange={(model) => setParameter('model', model)}
+              value={
+                ollamaModels
+                  ? (parameters.model ?? ollamaModels.defaultModel)
+                  : undefined
+              }
+            >
+              <SelectTrigger aria-label="Conversation model" className="w-full">
+                <SelectValue placeholder="Loading models..." />
+              </SelectTrigger>
+              <SelectContent>
+                {ollamaModels?.models.map((model) => (
+                  <SelectItem key={model} value={model}>
+                    {model}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            {ollamaModels?.usedFallback && (
+              <p className="text-amber-700 text-xs dark:text-amber-400">
+                Ollama model discovery failed. Using the configured default.
+              </p>
+            )}
+            {modelError && (
+              <p className="text-destructive text-xs">{modelError}</p>
+            )}
+          </section>
+
           <section className="grid gap-3 rounded-lg border bg-muted/15 p-4">
             <div className="flex items-start justify-between gap-4">
               <div>
@@ -309,6 +384,7 @@ export function ParametersDialog({
             disabled={
               parameters.temperature ===
                 defaultGenerationParameters.temperature &&
+              parameters.model === defaultGenerationParameters.model &&
               parameters.cloneVoice === defaultGenerationParameters.cloneVoice &&
               parameters.maxNewTokens ===
                 defaultGenerationParameters.maxNewTokens &&

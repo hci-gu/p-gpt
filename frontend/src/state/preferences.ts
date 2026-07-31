@@ -5,6 +5,7 @@ const backgroundStorageKey = 'p-gpt-background'
 const parametersStorageKey = 'p-gpt-generation-parameters'
 
 export type GenerationParameters = {
+  model: string | null
   temperature: number
   cloneVoice: boolean
   maxNewTokens: number
@@ -18,6 +19,7 @@ export const omnivoiceNumStepsFromLevel = (level: number) =>
   Math.round(22 + ((Math.min(10, Math.max(1, level)) - 1) * 10) / 9)
 
 export const defaultGenerationParameters: GenerationParameters = {
+  model: null,
   temperature: 1,
   cloneVoice: true,
   maxNewTokens: 256,
@@ -59,6 +61,10 @@ const getInitialGenerationParameters = (): GenerationParameters => {
       'temperature' in parsed && typeof parsed.temperature === 'number'
         ? Math.min(2, Math.max(0, parsed.temperature))
         : defaultGenerationParameters.temperature
+    const model =
+      'model' in parsed && typeof parsed.model === 'string' && parsed.model.trim()
+        ? parsed.model
+        : defaultGenerationParameters.model
     const cloneVoice =
       'cloneVoice' in parsed && typeof parsed.cloneVoice === 'boolean'
         ? parsed.cloneVoice
@@ -85,13 +91,15 @@ const getInitialGenerationParameters = (): GenerationParameters => {
     const seed =
       'seed' in parsed &&
       typeof parsed.seed === 'number' &&
-      Number.isSafeInteger(parsed.seed)
+      Number.isSafeInteger(parsed.seed) &&
+      parsed.seed >= 0
         ? parsed.seed
         : defaultGenerationParameters.seed
 
     return {
       cloneVoice,
       maxNewTokens,
+      model,
       repeatPenalty,
       seed,
       streaming,

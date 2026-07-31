@@ -6,6 +6,7 @@ from io import BytesIO
 import mlflow
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import re
@@ -23,7 +24,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from omnivoice import OmniVoice, VoiceClonePrompt
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 # FastAPI's development runner configures the Uvicorn logger hierarchy rather
 # than the root/module logger. Using a child keeps application INFO messages in
@@ -125,6 +126,7 @@ class PersonaProfile(BaseModel):
 
 
 class PersonaInput(BaseModel):
+    id: str
     name: str
     instruction_prompt: str
 
@@ -158,6 +160,7 @@ class StreamTTSRequest(TextGenerationRequest):
 
 
 class InitiateRequest(BaseModel):
+    persona_id: str = Field(min_length=1)
     persona_name: str = Field(min_length=1)
     instruction_prompt: str = Field(min_length=1)
     messages: list[ChatMessage]
@@ -175,11 +178,48 @@ class InitiateRequest(BaseModel):
     clone_voice: bool = True
     ref_audio: str | None = None
     stream_audio: bool = True
-    num_step: int = Field(default=26, gt=0)
+    num_step: int = 26
     speed: float = Field(default=0.8, gt=0)
     text_generation_timeout_seconds: float = Field(default=60, gt=0)
     tts_timeout_seconds: float = Field(default=300, gt=0)
     audio_chunk_size: int = Field(default=8192, gt=0)
+
+    @field_validator("temperature")
+    @classmethod
+    def clamp_temperature(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("temperature must be finite")
+        return min(2.0, max(0.0, value))
+
+    @field_validator("max_tokens")
+    @classmethod
+    def clamp_max_tokens(cls, value: int) -> int:
+        return min(8192, max(64, value))
+
+    @field_validator("repeat_penalty")
+    @classmethod
+    def clamp_repeat_penalty(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("repeat_penalty must be finite")
+        return min(1.2, max(1.0, value))
+
+    @field_validator("seed")
+    @classmethod
+    def clamp_seed(cls, value: int | None) -> int | None:
+        if value is None:
+            return None
+        return min(9_007_199_254_740_991, max(0, value))
+
+    @field_validator("num_step")
+    @classmethod
+    def clamp_num_step(cls, value: int) -> int:
+        return min(32, max(22, value))
+
+
+class OllamaModelsResponse(BaseModel):
+    models: list[str]
+    default_model: str
+    used_fallback: bool
 
 
 PERSONA_EXTRACTION_SEED = 0
@@ -193,6 +233,54 @@ personality faithfully. Do not infer or return the persona's name.
 """.strip()
 PERSONA_PROMPT_VARIABLES = {"name", "problem", "background"}
 PERSONA_EXTRACTION_BACKOFF_SECONDS = (0.25, 0.5)
+
+
+async def _get_available_ollama_models() -> OllamaModelsResponse:
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.get(f"{OLLAMA_BASE_URL}/api/tags")
+            response.raise_for_status()
+            payload = response.json()
+
+        raw_models = payload.get("models") if isinstance(payload, dict) else None
+        if not isinstance(raw_models, list):
+            raise ValueError("Ollama model response did not include a model list.")
+
+        model_names = {
+            model_name
+            for item in raw_models
+            if isinstance(item, dict)
+            for model_name in (item.get("model"), item.get("name"))
+            if isinstance(model_name, str) and model_name.strip()
+        }
+        if not model_names:
+            raise ValueError("Ollama did not report any installed models.")
+
+        model_names.add(settings.ollama_text_model)
+        return OllamaModelsResponse(
+            models=sorted(model_names),
+            default_model=settings.ollama_text_model,
+            used_fallback=False,
+        )
+    except (httpx.HTTPError, ValueError, json.JSONDecodeError) as exc:
+        logger.warning(
+            "Could not load installed Ollama models; using configured fallback: %s",
+            type(exc).__name__,
+        )
+        return OllamaModelsResponse(
+            models=[settings.ollama_text_model],
+            default_model=settings.ollama_text_model,
+            used_fallback=True,
+        )
+
+
+async def _validate_conversation_model(model: str) -> None:
+    available = await _get_available_ollama_models()
+    if model not in available.models:
+        raise HTTPException(
+            status_code=422,
+            detail=f"The selected Ollama model is not available: {model}",
+        )
 
 
 def load_prompt():
@@ -213,6 +301,7 @@ def _persona_cache_key(persona: PersonaInput, prompt: Any) -> str:
         "mlflow_prompt_name": settings.mlflow_prompt_name,
         "mlflow_prompt_version": str(prompt.version),
         "model": settings.ollama_text_model,
+        "persona_id": persona.id,
         "name": persona.name,
         "seed": PERSONA_EXTRACTION_SEED,
         "temperature": PERSONA_EXTRACTION_TEMPERATURE,
@@ -412,6 +501,7 @@ def _open_persona_prompt_cache() -> sqlite3.Connection:
         """
         CREATE TABLE IF NOT EXISTS persona_prompt_cache (
             cache_key TEXT PRIMARY KEY,
+            persona_id TEXT NOT NULL,
             persona_name TEXT NOT NULL,
             system_prompt TEXT NOT NULL,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -427,6 +517,13 @@ def _open_persona_prompt_cache() -> sqlite3.Connection:
             (
                 "ALTER TABLE persona_prompt_cache ADD COLUMN "
                 "persona_name TEXT NOT NULL DEFAULT ''"
+            )
+        )
+    if "persona_id" not in columns:
+        connection.execute(
+            (
+                "ALTER TABLE persona_prompt_cache ADD COLUMN "
+                "persona_id TEXT NOT NULL DEFAULT ''"
             )
         )
     connection.commit()
@@ -454,13 +551,13 @@ def _read_cached_system_prompt(cache_key: str) -> str | None:
     return row[0]
 
 
-def _has_cached_prompt_for_persona(persona_name: str) -> bool:
+def _has_cached_prompt_for_persona(persona_id: str) -> bool:
     connection: sqlite3.Connection | None = None
     try:
         connection = _open_persona_prompt_cache()
         row = connection.execute(
-            "SELECT 1 FROM persona_prompt_cache WHERE persona_name = ? LIMIT 1",
-            (persona_name,),
+            "SELECT 1 FROM persona_prompt_cache WHERE persona_id = ? LIMIT 1",
+            (persona_id,),
         ).fetchone()
     except sqlite3.Error as exc:
         raise HTTPException(
@@ -475,6 +572,7 @@ def _has_cached_prompt_for_persona(persona_name: str) -> bool:
 
 def _write_cached_system_prompt(
     cache_key: str,
+    persona_id: str,
     persona_name: str,
     system_prompt: str,
 ) -> None:
@@ -485,16 +583,18 @@ def _write_cached_system_prompt(
             """
             INSERT INTO persona_prompt_cache (
                 cache_key,
+                persona_id,
                 persona_name,
                 system_prompt
             )
-            VALUES (?, ?, ?)
+            VALUES (?, ?, ?, ?)
             ON CONFLICT(cache_key) DO UPDATE SET
+                persona_id = excluded.persona_id,
                 persona_name = excluded.persona_name,
                 system_prompt = excluded.system_prompt,
                 created_at = CURRENT_TIMESTAMP
             """,
-            (cache_key, persona_name, system_prompt),
+            (cache_key, persona_id, persona_name, system_prompt),
         )
         connection.commit()
     except sqlite3.Error as exc:
@@ -508,10 +608,12 @@ def _write_cached_system_prompt(
 
 
 async def _resolve_persona_system_prompt(
+    persona_id: str,
     persona_name: str,
     instruction_prompt: str,
 ) -> str:
     persona = PersonaInput(
+        id=persona_id.strip(),
         name=persona_name.strip(),
         instruction_prompt=instruction_prompt.strip(),
     )
@@ -536,7 +638,7 @@ async def _resolve_persona_system_prompt(
         )
         return cached_prompt
 
-    lock = persona_prompt_locks.setdefault(cache_key, asyncio.Lock())
+    lock = persona_prompt_locks.setdefault(persona.id, asyncio.Lock())
     async with lock:
         cached_prompt = await asyncio.to_thread(
             _read_cached_system_prompt,
@@ -552,19 +654,21 @@ async def _resolve_persona_system_prompt(
 
         is_update = await asyncio.to_thread(
             _has_cached_prompt_for_persona,
-            persona.name,
+            persona.id,
         )
         profile = await _extract_persona_profile(persona.instruction_prompt)
         system_prompt = _render_system_prompt(prompt, persona, profile)
         await asyncio.to_thread(
             _write_cached_system_prompt,
             cache_key,
+            persona.id,
             persona.name,
             system_prompt,
         )
         logger.info(
-            "%s persona system prompt: persona=%r cache_key=%s system_prompt=%r",
+            "%s persona system prompt: persona_id=%r persona=%r cache_key=%s system_prompt=%r",
             "Updated" if is_update else "Created",
+            persona.id,
             persona.name,
             cache_key,
             system_prompt,
@@ -1188,6 +1292,12 @@ def _interrupt_request_state(request_id: str, state: RequestState) -> dict[str, 
 
 
 
+@app.get("/ollama/models")
+async def get_ollama_models() -> OllamaModelsResponse:
+    """Return conversation models available through the configured Ollama server."""
+    return await _get_available_ollama_models()
+
+
 @app.post("/initiate-request")
 async def initiate_request(request: InitiateRequest) -> dict[str, str]:
     """Frontend's first point of contact for a message. Stores a conversation request and returns a UUID for the stream endpoint.
@@ -1195,7 +1305,9 @@ async def initiate_request(request: InitiateRequest) -> dict[str, str]:
         - `GET /requests/{request_id}/text`
         - `GET /requests/{request_id}/audio`.
     """
+    await _validate_conversation_model(request.model)
     system_prompt = await _resolve_persona_system_prompt(
+        request.persona_id,
         request.persona_name,
         request.instruction_prompt,
     )
@@ -1380,7 +1492,9 @@ async def initiate_pseudo_stream_request(
     request: InitiateRequest,
 ) -> dict[str, str]:
     """Start the isolated streaming-text/pseudo-streaming-audio pipeline."""
+    await _validate_conversation_model(request.model)
     system_prompt = await _resolve_persona_system_prompt(
+        request.persona_id,
         request.persona_name,
         request.instruction_prompt,
     )

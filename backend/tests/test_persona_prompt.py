@@ -1,5 +1,6 @@
 import asyncio
 from pathlib import Path
+import sqlite3
 import sys
 import tempfile
 import types
@@ -55,6 +56,33 @@ class FakeAsyncClient:
     async def post(self, _url: str, json: dict):
         self.payloads.append(json)
         return self.responses.pop(0)
+
+
+class FakeTagsResponse:
+    def __init__(self, data: object):
+        self._data = data
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self._data
+
+
+class FakeTagsClient:
+    def __init__(self, result: FakeTagsResponse | Exception):
+        self.result = result
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+    async def get(self, _url: str):
+        if isinstance(self.result, Exception):
+            raise self.result
+        return self.result
 
 
 class FakePrompt:
@@ -174,10 +202,12 @@ class PersonaPromptCacheTests(unittest.IsolatedAsyncioTestCase):
     def test_instruction_change_produces_a_new_cache_key(self):
         prompt = FakePrompt()
         first = app.PersonaInput(
+            id="persona-1",
             name="Morgan",
             instruction_prompt="First instruction",
         )
         second = app.PersonaInput(
+            id="persona-1",
             name="Morgan",
             instruction_prompt="Changed instruction",
         )
@@ -187,8 +217,55 @@ class PersonaPromptCacheTests(unittest.IsolatedAsyncioTestCase):
             app._persona_cache_key(second, prompt),
         )
 
+    def test_duplicate_names_are_isolated_by_persona_id(self):
+        prompt = FakePrompt()
+        first = app.PersonaInput(
+            id="persona-1",
+            name="Morgan",
+            instruction_prompt="Shared instructions",
+        )
+        second = app.PersonaInput(
+            id="persona-2",
+            name="Morgan",
+            instruction_prompt="Shared instructions",
+        )
+
+        self.assertNotEqual(
+            app._persona_cache_key(first, prompt),
+            app._persona_cache_key(second, prompt),
+        )
+
+    def test_legacy_cache_schema_adds_persona_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache_path = str(Path(directory) / "cache.sqlite3")
+            connection = sqlite3.connect(cache_path)
+            connection.execute(
+                """
+                CREATE TABLE persona_prompt_cache (
+                    cache_key TEXT PRIMARY KEY,
+                    persona_name TEXT NOT NULL,
+                    system_prompt TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            connection.close()
+
+            with patch.object(app.settings, "persona_prompt_cache_path", cache_path):
+                upgraded = app._open_persona_prompt_cache()
+                columns = {
+                    row[1]
+                    for row in upgraded.execute(
+                        "PRAGMA table_info(persona_prompt_cache)"
+                    )
+                }
+                upgraded.close()
+
+        self.assertIn("persona_id", columns)
+
     async def test_cache_hit_skips_extraction(self):
         persona = app.PersonaInput(
+            id="persona-1",
             name="Morgan",
             instruction_prompt="Persona instructions",
         )
@@ -198,7 +275,12 @@ class PersonaPromptCacheTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             cache_path = str(Path(directory) / "cache.sqlite3")
             with patch.object(app.settings, "persona_prompt_cache_path", cache_path):
-                app._write_cached_system_prompt(cache_key, persona.name, "cached")
+                app._write_cached_system_prompt(
+                    cache_key,
+                    persona.id,
+                    persona.name,
+                    "cached",
+                )
                 with (
                     patch.object(app, "load_prompt", return_value=prompt),
                     patch.object(
@@ -208,6 +290,7 @@ class PersonaPromptCacheTests(unittest.IsolatedAsyncioTestCase):
                     ) as extract,
                 ):
                     result = await app._resolve_persona_system_prompt(
+                        persona.id,
                         persona.name,
                         persona.instruction_prompt,
                     )
@@ -217,6 +300,7 @@ class PersonaPromptCacheTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cache_miss_extracts_renders_and_persists(self):
         persona = app.PersonaInput(
+            id="persona-1",
             name="Morgan",
             instruction_prompt="Persona instructions",
         )
@@ -238,10 +322,12 @@ class PersonaPromptCacheTests(unittest.IsolatedAsyncioTestCase):
                 ) as extract,
             ):
                 result = await app._resolve_persona_system_prompt(
+                    persona.id,
                     persona.name,
                     persona.instruction_prompt,
                 )
                 cached_result = await app._resolve_persona_system_prompt(
+                    persona.id,
                     persona.name,
                     persona.instruction_prompt,
                 )
@@ -279,10 +365,12 @@ class PersonaPromptCacheTests(unittest.IsolatedAsyncioTestCase):
                 self.assertLogs("uvicorn.error.p_gpt", level="INFO") as logs,
             ):
                 await app._resolve_persona_system_prompt(
+                    "persona-1",
                     "Morgan",
                     "First instruction",
                 )
                 await app._resolve_persona_system_prompt(
+                    "persona-1",
                     "Morgan",
                     "Changed instruction",
                 )
@@ -294,9 +382,137 @@ class PersonaPromptCacheTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Morgan|Grief|Recently lost a close friend.", output)
 
 
+class RequestSafetyTests(unittest.TestCase):
+    def test_ui_numeric_values_are_unchanged_inside_ranges(self):
+        request = app.InitiateRequest(
+            persona_id="persona-1",
+            persona_name="Morgan",
+            instruction_prompt="Persona instructions",
+            messages=[],
+            temperature=1.25,
+            max_tokens=512,
+            repeat_penalty=1.1,
+            seed=42,
+            num_step=27,
+        )
+
+        self.assertEqual(request.temperature, 1.25)
+        self.assertEqual(request.max_tokens, 512)
+        self.assertEqual(request.repeat_penalty, 1.1)
+        self.assertEqual(request.seed, 42)
+        self.assertEqual(request.num_step, 27)
+
+    def test_ui_numeric_values_are_clamped_to_frontend_ranges(self):
+        low = app.InitiateRequest(
+            persona_id="persona-1",
+            persona_name="Morgan",
+            instruction_prompt="Persona instructions",
+            messages=[],
+            temperature=-100,
+            max_tokens=-100,
+            repeat_penalty=-100,
+            seed=-100,
+            num_step=-100,
+        )
+        high = app.InitiateRequest(
+            persona_id="persona-1",
+            persona_name="Morgan",
+            instruction_prompt="Persona instructions",
+            messages=[],
+            temperature=100,
+            max_tokens=100_000,
+            repeat_penalty=100,
+            seed=10**30,
+            num_step=100,
+        )
+
+        self.assertEqual(
+            (low.temperature, low.max_tokens, low.repeat_penalty, low.seed, low.num_step),
+            (0, 64, 1, 0, 22),
+        )
+        self.assertEqual(
+            (
+                high.temperature,
+                high.max_tokens,
+                high.repeat_penalty,
+                high.seed,
+                high.num_step,
+            ),
+            (2, 8192, 1.2, 9_007_199_254_740_991, 32),
+        )
+
+    def test_non_numeric_value_is_rejected(self):
+        with self.assertRaises(app.ValidationError):
+            app.InitiateRequest(
+                persona_id="persona-1",
+                persona_name="Morgan",
+                instruction_prompt="Persona instructions",
+                messages=[],
+                temperature="malicious",
+            )
+
+
+class OllamaModelTests(unittest.IsolatedAsyncioTestCase):
+    async def test_model_listing_returns_installed_models(self):
+        client = FakeTagsClient(
+            FakeTagsResponse(
+                {"models": [{"name": "configured"}, {"model": "second"}]}
+            )
+        )
+        with (
+            patch.object(app.settings, "ollama_text_model", "configured"),
+            patch.object(app.httpx, "AsyncClient", return_value=client),
+        ):
+            result = await app._get_available_ollama_models()
+
+        self.assertEqual(result.models, ["configured", "second"])
+        self.assertFalse(result.used_fallback)
+
+    async def test_model_listing_uses_configured_fallback_when_offline(self):
+        client = FakeTagsClient(app.httpx.ConnectError("offline"))
+        with (
+            patch.object(app.settings, "ollama_text_model", "configured"),
+            patch.object(app.httpx, "AsyncClient", return_value=client),
+        ):
+            result = await app._get_available_ollama_models()
+
+        self.assertEqual(result.models, ["configured"])
+        self.assertTrue(result.used_fallback)
+
+    async def test_model_validation_accepts_reported_model(self):
+        response = app.OllamaModelsResponse(
+            models=["configured", "selected"],
+            default_model="configured",
+            used_fallback=False,
+        )
+        with patch.object(
+            app,
+            "_get_available_ollama_models",
+            new=AsyncMock(return_value=response),
+        ):
+            await app._validate_conversation_model("selected")
+
+    async def test_model_validation_rejects_unavailable_model(self):
+        response = app.OllamaModelsResponse(
+            models=["configured"],
+            default_model="configured",
+            used_fallback=True,
+        )
+        with patch.object(
+            app,
+            "_get_available_ollama_models",
+            new=AsyncMock(return_value=response),
+        ):
+            with self.assertRaises(app.HTTPException) as raised:
+                await app._validate_conversation_model("unavailable")
+
+        self.assertEqual(raised.exception.status_code, 422)
+
+
 class ConversationConstructionTests(unittest.TestCase):
     def test_backend_replaces_all_client_system_messages(self):
         request = app.InitiateRequest(
+            persona_id="persona-1",
             persona_name="Morgan",
             instruction_prompt="Persona instructions",
             messages=[

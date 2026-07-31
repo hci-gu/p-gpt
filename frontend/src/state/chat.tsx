@@ -2,6 +2,7 @@
 
 import type { ToolUIPart } from 'ai'
 import { create } from 'zustand'
+import { getApiErrorMessage } from '@/lib/api-error'
 import {
   createChatHistory,
   type StoredChatMessage,
@@ -33,6 +34,7 @@ export interface MessageType {
     id: string
     content: string
     contentStatus?: 'pending' | 'ready' | 'error'
+    audioError?: string
     audioPlaybackComplete?: boolean
     audioUrl?: string
   }[]
@@ -67,6 +69,7 @@ const createMessageId = (prefix: string) =>
 const toChatHistory = (messages: MessageType[]): StoredChatMessage[] =>
   messages.flatMap((message) =>
     message.versions
+      .filter((version) => version.contentStatus !== 'error')
       .map((version) => ({
         content: version.content.trim(),
         role: message.from,
@@ -77,6 +80,7 @@ const toChatHistory = (messages: MessageType[]): StoredChatMessage[] =>
 type ChatRequestParameters = {
   cloneVoice: boolean
   maxNewTokens: number
+  model: string | null
   numSteps: number
   refAudio?: string
   repeatPenalty: 1 | 1.1 | 1.2
@@ -87,6 +91,7 @@ type ChatRequestParameters = {
 
 const initializeChat = async (
   messages: StoredChatMessage[],
+  personaId: string,
   personaName: string,
   instructionPrompt: string,
   parameters: ChatRequestParameters,
@@ -98,7 +103,9 @@ const initializeChat = async (
       instruction_prompt: instructionPrompt,
       max_tokens: parameters.maxNewTokens,
       messages,
+      ...(parameters.model ? { model: parameters.model } : {}),
       num_step: parameters.numSteps,
+      persona_id: personaId,
       persona_name: personaName,
       ref_audio:
         parameters.cloneVoice && parameters.refAudio
@@ -119,7 +126,7 @@ const initializeChat = async (
   })
 
   if (!response.ok) {
-    throw new Error(`Chat initialization failed with status ${response.status}`)
+    throw new Error(await getApiErrorMessage(response, 'Chat initialization failed'))
   }
 
   const data: unknown = await response.json()
@@ -158,7 +165,7 @@ const fetchTextResponse = async (
   })
 
   if (!response.ok) {
-    throw new Error(`Chat text request failed with status ${response.status}`)
+    throw new Error(await getApiErrorMessage(response, 'Text generation failed'))
   }
 
   const contentType = response.headers.get('content-type')
@@ -245,7 +252,11 @@ interface ChatState {
   updateMessageContent: (messageId: string, newContent: string) => void
   updateMessageAudio: (messageId: string, audioUrl: string) => void
   completeAssistantResponse: (messageId: string) => void
-  failAssistantResponse: (messageId: string) => void
+  failAssistantResponse: (
+    messageId: string,
+    errorMessage: string,
+    preserveContent?: boolean
+  ) => void
   interruptAssistantResponse: () => Promise<void>
   fetchAssistantResponse: (
     messageId: string,
@@ -332,7 +343,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
             ...msg,
             versions: msg.versions.map((v) =>
               v.id === messageId
-                ? { ...v, content: newContent, contentStatus: 'ready' }
+                ? {
+                    ...v,
+                    content: v.audioError
+                      ? `${newContent}\n\n${v.audioError}`
+                      : newContent,
+                    contentStatus: v.audioError ? 'error' : 'ready',
+                  }
                 : v
             ),
           }
@@ -388,7 +405,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     })
     get().persistConversation(toChatHistory(get().messages))
   },
-  failAssistantResponse: (messageId) => {
+  failAssistantResponse: (messageId, errorMessage, preserveContent = false) => {
     set((state) => ({
       messages: state.messages.map((msg) => {
         if (msg.versions.some((v) => v.id === messageId)) {
@@ -398,8 +415,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
               v.id === messageId
                 ? {
                     ...v,
+                    audioError: preserveContent ? errorMessage : undefined,
                     audioPlaybackComplete: true,
-                    content: 'Failed to generate audio response.',
+                    audioUrl: undefined,
+                    content:
+                      preserveContent && v.content.trim()
+                        ? `${v.content}\n\n${errorMessage}`
+                        : errorMessage,
                     contentStatus: 'error',
                   }
                 : v
@@ -506,11 +528,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
       const chatId = await initializeChat(
         requestHistory,
+        persona.id,
         persona.name,
         persona.instructionPrompt,
         {
           cloneVoice: parameters.cloneVoice,
           maxNewTokens: parameters.maxNewTokens,
+          model: parameters.model,
           numSteps: omnivoiceNumStepsFromLevel(parameters.ttsStepLevel),
           refAudio: persona?.audioSampleUrl ?? undefined,
           repeatPenalty: parameters.repeatPenalty,
@@ -541,13 +565,23 @@ export const useChatStore = create<ChatState>((set, get) => ({
           if (error instanceof DOMException && error.name === 'AbortError') {
             return
           }
-          get().failAssistantResponse(messageId)
+          get().failAssistantResponse(
+            messageId,
+            error instanceof Error
+              ? error.message
+              : 'Text generation failed: unknown error.'
+          )
         })
     } catch (error) {
       if (error instanceof DOMException && error.name === 'AbortError') {
         return
       }
-      get().failAssistantResponse(messageId)
+      get().failAssistantResponse(
+        messageId,
+        error instanceof Error
+          ? error.message
+          : 'Chat initialization failed: unknown error.'
+      )
     }
   },
   persistConversation: (conversation) => {

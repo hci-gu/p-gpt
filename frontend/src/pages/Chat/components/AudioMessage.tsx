@@ -2,6 +2,7 @@
 
 import { BotIcon } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
+import { getApiErrorMessage } from '@/lib/api-error'
 
 const pcmSampleRate = 24_000
 const waveBars = Array.from({ length: 18 }, (_, index) => index)
@@ -68,7 +69,7 @@ export const AudioMessage = ({
   volume,
 }: {
   onEnded: () => void
-  onError: () => void
+  onError: (message: string) => void
   onLevelChange?: (level: number) => void
   onPlaybackStart?: () => void
   src: string
@@ -113,7 +114,9 @@ export const AudioMessage = ({
     const abortController = new AbortController()
 
     if (!AudioContextConstructor) {
-      onErrorRef.current()
+      onErrorRef.current(
+        'Audio generation failed: Web Audio is not supported by this browser.'
+      )
       return undefined
     }
 
@@ -222,8 +225,13 @@ export const AudioMessage = ({
           signal: abortController.signal,
         })
 
-        if (!response.ok || !response.body) {
-          throw new Error(`Audio stream failed with status ${response.status}`)
+        if (!response.ok) {
+          throw new Error(
+            await getApiErrorMessage(response, 'Audio generation failed')
+          )
+        }
+        if (!response.body) {
+          throw new Error('Audio generation failed: response had no audio stream.')
         }
 
         const reader = response.body.getReader()
@@ -252,16 +260,20 @@ export const AudioMessage = ({
 
         streamDoneRef.current = true
         if (!receivedAnyAudio) {
-          throw new Error('Audio stream completed without audio.')
+          throw new Error('Audio generation failed: response contained no audio.')
         }
         maybeFinishPlayback()
-      } catch {
+      } catch (error) {
         if (abortController.signal.aborted) {
           return
         }
 
         stopVisuals()
-        onErrorRef.current()
+        onErrorRef.current(
+          error instanceof Error
+            ? error.message
+            : 'Audio generation failed: unknown error.'
+        )
       }
     }
 

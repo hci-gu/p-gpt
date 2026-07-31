@@ -373,10 +373,14 @@ const ChatPage = () => {
                               setAssistantAudioLevel(0)
                               completeAssistantResponse(version.id)
                             }}
-                            onError={() => {
+                            onError={(errorMessage) => {
                               setIsAssistantAudioPlaying(false)
                               setAssistantAudioLevel(0)
-                              failAssistantResponse(version.id)
+                              failAssistantResponse(
+                                version.id,
+                                errorMessage,
+                                true
+                              )
                             }}
                             src={version.audioUrl}
                             volume={ttsVolume}
