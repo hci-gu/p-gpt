@@ -412,11 +412,23 @@ def _open_persona_prompt_cache() -> sqlite3.Connection:
         """
         CREATE TABLE IF NOT EXISTS persona_prompt_cache (
             cache_key TEXT PRIMARY KEY,
+            persona_name TEXT NOT NULL,
             system_prompt TEXT NOT NULL,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
         """
     )
+    columns = {
+        row[1]
+        for row in connection.execute("PRAGMA table_info(persona_prompt_cache)")
+    }
+    if "persona_name" not in columns:
+        connection.execute(
+            (
+                "ALTER TABLE persona_prompt_cache ADD COLUMN "
+                "persona_name TEXT NOT NULL DEFAULT ''"
+            )
+        )
     connection.commit()
     return connection
 
@@ -442,19 +454,47 @@ def _read_cached_system_prompt(cache_key: str) -> str | None:
     return row[0]
 
 
-def _write_cached_system_prompt(cache_key: str, system_prompt: str) -> None:
+def _has_cached_prompt_for_persona(persona_name: str) -> bool:
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = _open_persona_prompt_cache()
+        row = connection.execute(
+            "SELECT 1 FROM persona_prompt_cache WHERE persona_name = ? LIMIT 1",
+            (persona_name,),
+        ).fetchone()
+    except sqlite3.Error as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="The persona prompt cache could not be inspected.",
+        ) from exc
+    finally:
+        if connection is not None:
+            connection.close()
+    return row is not None
+
+
+def _write_cached_system_prompt(
+    cache_key: str,
+    persona_name: str,
+    system_prompt: str,
+) -> None:
     connection: sqlite3.Connection | None = None
     try:
         connection = _open_persona_prompt_cache()
         connection.execute(
             """
-            INSERT INTO persona_prompt_cache (cache_key, system_prompt)
-            VALUES (?, ?)
+            INSERT INTO persona_prompt_cache (
+                cache_key,
+                persona_name,
+                system_prompt
+            )
+            VALUES (?, ?, ?)
             ON CONFLICT(cache_key) DO UPDATE SET
+                persona_name = excluded.persona_name,
                 system_prompt = excluded.system_prompt,
                 created_at = CURRENT_TIMESTAMP
             """,
-            (cache_key, system_prompt),
+            (cache_key, persona_name, system_prompt),
         )
         connection.commit()
     except sqlite3.Error as exc:
@@ -489,6 +529,11 @@ async def _resolve_persona_system_prompt(
         cache_key,
     )
     if cached_prompt is not None:
+        logger.info(
+            "Using cached persona system prompt: persona=%r cache_key=%s",
+            persona.name,
+            cache_key,
+        )
         return cached_prompt
 
     lock = persona_prompt_locks.setdefault(cache_key, asyncio.Lock())
@@ -498,12 +543,29 @@ async def _resolve_persona_system_prompt(
             cache_key,
         )
         if cached_prompt is not None:
+            logger.info(
+                "Using cached persona system prompt: persona=%r cache_key=%s",
+                persona.name,
+                cache_key,
+            )
             return cached_prompt
 
+        is_update = await asyncio.to_thread(
+            _has_cached_prompt_for_persona,
+            persona.name,
+        )
         profile = await _extract_persona_profile(persona.instruction_prompt)
         system_prompt = _render_system_prompt(prompt, persona, profile)
         await asyncio.to_thread(
             _write_cached_system_prompt,
+            cache_key,
+            persona.name,
+            system_prompt,
+        )
+        logger.info(
+            "%s persona system prompt: persona=%r cache_key=%s system_prompt=%r",
+            "Updated" if is_update else "Created",
+            persona.name,
             cache_key,
             system_prompt,
         )

@@ -198,7 +198,7 @@ class PersonaPromptCacheTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             cache_path = str(Path(directory) / "cache.sqlite3")
             with patch.object(app.settings, "persona_prompt_cache_path", cache_path):
-                app._write_cached_system_prompt(cache_key, "cached")
+                app._write_cached_system_prompt(cache_key, persona.name, "cached")
                 with (
                     patch.object(app, "load_prompt", return_value=prompt),
                     patch.object(
@@ -252,6 +252,46 @@ class PersonaPromptCacheTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(cached_result, result)
         extract.assert_awaited_once_with("Persona instructions")
+
+    async def test_logs_created_prompt_and_changed_instruction_update(self):
+        prompt = FakePrompt()
+        profiles = [
+            app.PersonaProfile(
+                problem="Anxiety",
+                background="Avoids unfamiliar social situations.",
+            ),
+            app.PersonaProfile(
+                problem="Grief",
+                background="Recently lost a close friend.",
+            ),
+        ]
+
+        with tempfile.TemporaryDirectory() as directory:
+            cache_path = str(Path(directory) / "cache.sqlite3")
+            with (
+                patch.object(app.settings, "persona_prompt_cache_path", cache_path),
+                patch.object(app, "load_prompt", return_value=prompt),
+                patch.object(
+                    app,
+                    "_extract_persona_profile",
+                    new=AsyncMock(side_effect=profiles),
+                ),
+                self.assertLogs("uvicorn.error.p_gpt", level="INFO") as logs,
+            ):
+                await app._resolve_persona_system_prompt(
+                    "Morgan",
+                    "First instruction",
+                )
+                await app._resolve_persona_system_prompt(
+                    "Morgan",
+                    "Changed instruction",
+                )
+
+        output = "\n".join(logs.output)
+        self.assertIn("Created persona system prompt", output)
+        self.assertIn("Updated persona system prompt", output)
+        self.assertIn("Morgan|Anxiety|Avoids unfamiliar social situations.", output)
+        self.assertIn("Morgan|Grief|Recently lost a close friend.", output)
 
 
 class ConversationConstructionTests(unittest.TestCase):
