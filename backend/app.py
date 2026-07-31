@@ -2,6 +2,7 @@ import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from io import BytesIO
+import mlflow
 import json
 import logging
 import os
@@ -25,7 +26,7 @@ from pydantic import BaseModel, Field
 # than the root/module logger. Using a child keeps application INFO messages in
 # the same terminal feed as server startup and request logs.
 logger = logging.getLogger("uvicorn.error.p_gpt")
-
+logger.info(f"Running mlflow on tracking URI: {mlflow.get_tracking_uri()}")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -1121,3 +1122,10 @@ async def stream_pseudo_stream_audio(request_id: str) -> StreamingResponse:
             )
 
     return StreamingResponse(audio_chunks(), media_type="audio/pcm")
+
+
+def load_prompt():
+    prompt_uri = f"prompts:/{settings.mlflow_prompt_name}" + ("/" if isinstance(settings.mlflow_prompt_version, int) else "@") + str(settings.mlflow_prompt_version)
+    logger.info(f"Loading prompt: {prompt_uri}")
+    prompt = mlflow.genai.load_prompt(prompt_uri)
+    return prompt

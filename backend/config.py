@@ -6,6 +6,8 @@ class Settings(BaseSettings):
     tts_model: str = "k2-fsa/OmniVoice"
     vllm_tts_model: str = "mistralai/Voxtral-4B-TTS-2603"
     pocketbase_base_url: str = "http://127.0.0.1:8090"
+    mlflow_prompt_name: str = "pgpt-prompt"
+    mlflow_prompt_version: int | str = "latest"
 
     model_config = SettingsConfigDict(
         env_file=".env",
