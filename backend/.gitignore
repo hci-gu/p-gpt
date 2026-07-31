@@ -1,4 +1,5 @@
 .venv
 .env
 *.wav
+*.sqlite3
 __pycache__

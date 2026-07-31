@@ -87,15 +87,19 @@ type ChatRequestParameters = {
 
 const initializeChat = async (
   messages: StoredChatMessage[],
+  personaName: string,
+  instructionPrompt: string,
   parameters: ChatRequestParameters,
   signal?: AbortSignal
 ) => {
   const response = await fetch(chatInitializeEndpoint(parameters.streaming), {
     body: JSON.stringify({
       clone_voice: parameters.cloneVoice,
+      instruction_prompt: instructionPrompt,
       max_tokens: parameters.maxNewTokens,
       messages,
       num_step: parameters.numSteps,
+      persona_name: personaName,
       ref_audio:
         parameters.cloneVoice && parameters.refAudio
           ? parameters.refAudio
@@ -487,12 +491,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
       const persona = personasState.personas.find(
         (candidate) => candidate.id === personaId
       )
-      const requestHistory: StoredChatMessage[] = persona?.instructionPrompt
-        ? [
-            { role: 'system', content: persona.instructionPrompt },
-            ...history,
-          ]
-        : history
+      if (!persona) {
+        throw new Error('A valid persona must be selected before chatting.')
+      }
+      const requestHistory = history.filter(
+        (message) => message.role !== 'system'
+      )
       const parameters =
         usePreferencesStore.getState().generationParameters
 
@@ -502,6 +506,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
       const chatId = await initializeChat(
         requestHistory,
+        persona.name,
+        persona.instructionPrompt,
         {
           cloneVoice: parameters.cloneVoice,
           maxNewTokens: parameters.maxNewTokens,
