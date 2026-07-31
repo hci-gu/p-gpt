@@ -53,10 +53,10 @@ export interface MessageType {
 export const initialMessages: MessageType[] = []
 
 export const suggestions = [
+  'Hello!',
   'Who are you?',
-  'Tell me your top 5 favorite movies',
-  'What did you do yesterday?',
-  "Give me 5 bulletpoints list on what to bring on a camping trip and why."
+  'Breifly describe yourself',
+  'Welcome, how can I help you today?',
 ]
 
 export type ChatStatus = 'submitted' | 'streaming' | 'ready' | 'error'
