@@ -51,6 +51,7 @@ async def lifespan(app: FastAPI):
     app.state.tts_lock = asyncio.Lock()
     app.state.voice_clone_prompts = {}
     app.state.voice_clone_prompt_tasks = {}
+    persona_preparations.clear()
 
     logger.info("OmniVoice is online; running warmup inference")
     warmup_start = time()
@@ -73,6 +74,14 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        preparation_tasks = [
+            state.task
+            for state in persona_preparations.values()
+            if state.task is not None
+        ]
+        if preparation_tasks:
+            await asyncio.gather(*preparation_tasks, return_exceptions=True)
+        persona_preparations.clear()
         prompt_tasks = list(app.state.voice_clone_prompt_tasks.values())
         if prompt_tasks:
             await asyncio.gather(*prompt_tasks, return_exceptions=True)
@@ -100,6 +109,7 @@ app.add_middleware(
 )
 pending_requests: dict[str, "RequestState"] = {}
 pseudo_stream_requests: dict[str, "PseudoStreamRequestState"] = {}
+persona_preparations: dict[str, "PersonaPreparationState"] = {}
 persona_prompt_locks: dict[str, asyncio.Lock] = {}
 CANCELLED_REQUEST_DETAIL = "Request interrupted."
 
@@ -194,6 +204,7 @@ class InitiateRequest(BaseModel):
     tts_timeout_seconds: float = Field(default=300, gt=0)
     audio_chunk_size: int = Field(default=8192, gt=0)
 
+
     @field_validator("temperature")
     @classmethod
     def clamp_temperature(cls, value: float) -> float:
@@ -224,6 +235,16 @@ class InitiateRequest(BaseModel):
     @classmethod
     def clamp_num_step(cls, value: int) -> int:
         return min(32, max(22, value))
+
+
+class PersonaPreparationRequest(BaseModel):
+    persona_id: str = Field(min_length=1)
+    persona_name: str = Field(min_length=1)
+    instruction_prompt: str = Field(min_length=1)
+    audio_sample_url: str | None = None
+    previous_audio_sample_url: str | None = None
+    prepare_system_prompt: bool = False
+    prepare_voice_clone_prompt: bool = False
 
 
 class OllamaModelsResponse(BaseModel):
@@ -714,6 +735,14 @@ class PseudoStreamRequestState:
         self.audio_started = False
 
 
+class PersonaPreparationState:
+    def __init__(self, request: PersonaPreparationRequest) -> None:
+        self.request = request
+        self.error: str | None = None
+        self.status: Literal["pending", "ready", "error"] = "pending"
+        self.task: asyncio.Task[None] | None = None
+
+
 def _content_type_for_audio_format(response_format: str) -> str:
     content_types = {
         "aac": "audio/aac",
@@ -1079,6 +1108,51 @@ async def _get_or_create_voice_clone_prompt(ref_audio: str) -> VoiceClonePrompt:
     return prompt
 
 
+async def _run_persona_preparation(
+    preparation_id: str,
+    state: PersonaPreparationState,
+) -> None:
+    request = state.request
+
+    try:
+        tasks: list[Any] = []
+        if request.prepare_system_prompt:
+            tasks.append(
+                _resolve_persona_system_prompt(
+                    request.persona_id,
+                    request.persona_name,
+                    request.instruction_prompt,
+                )
+            )
+
+        if request.prepare_voice_clone_prompt:
+            if not request.audio_sample_url:
+                raise ValueError("A replacement audio sample is required.")
+
+            previous_audio_url = request.previous_audio_sample_url
+            if (
+                previous_audio_url
+                and previous_audio_url != request.audio_sample_url
+            ):
+                app.state.voice_clone_prompts.pop(previous_audio_url, None)
+
+            tasks.append(_get_or_create_voice_clone_prompt(request.audio_sample_url))
+
+        if tasks:
+            await asyncio.gather(*tasks)
+        state.status = "ready"
+        logger.info("Persona preparation completed: preparation_id=%s", preparation_id)
+    except Exception as exc:
+        state.error = str(exc)
+        state.status = "error"
+        logger.exception(
+            "Persona preparation failed: preparation_id=%s",
+            preparation_id,
+        )
+    finally:
+        state.task = None
+
+
 def _log_voice_clone_prompt_result(
     request_id: str,
     task: asyncio.Task[VoiceClonePrompt],
@@ -1335,6 +1409,41 @@ def _interrupt_request_state(request_id: str, state: RequestState) -> dict[str, 
 async def get_ollama_models() -> OllamaModelsResponse:
     """Return conversation models available through the configured Ollama server."""
     return await _get_available_ollama_models()
+
+
+@app.post("/persona-preparations")
+async def create_persona_preparation(
+    request: PersonaPreparationRequest,
+) -> dict[str, str | None]:
+    if request.prepare_voice_clone_prompt and not request.audio_sample_url:
+        raise HTTPException(
+            status_code=422,
+            detail="A replacement audio sample is required for voice preparation.",
+        )
+
+    preparation_id = str(uuid4())
+    state = PersonaPreparationState(request)
+    persona_preparations[preparation_id] = state
+
+    if request.prepare_system_prompt or request.prepare_voice_clone_prompt:
+        state.task = asyncio.create_task(
+            _run_persona_preparation(preparation_id, state)
+        )
+    else:
+        state.status = "ready"
+
+    return {"id": preparation_id, "status": state.status, "error": state.error}
+
+
+@app.get("/persona-preparations/{preparation_id}")
+async def get_persona_preparation(
+    preparation_id: str,
+) -> dict[str, str | None]:
+    state = persona_preparations.get(preparation_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="Unknown persona preparation.")
+
+    return {"id": preparation_id, "status": state.status, "error": state.error}
 
 
 @app.post("/initiate-request")

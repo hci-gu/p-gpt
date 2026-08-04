@@ -382,6 +382,93 @@ class PersonaPromptCacheTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Morgan|Grief|Recently lost a close friend.", output)
 
 
+class PersonaPreparationTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        app.persona_preparations.clear()
+        app.app.state.voice_clone_prompts = {}
+        app.app.state.voice_clone_prompt_tasks = {}
+
+    async def test_preparation_warms_changed_prompt_and_voice(self):
+        request = app.PersonaPreparationRequest(
+            persona_id="persona-1",
+            persona_name="Morgan",
+            instruction_prompt="Changed instructions",
+            audio_sample_url="http://localhost:8090/api/files/personas/new.wav",
+            prepare_system_prompt=True,
+            prepare_voice_clone_prompt=True,
+        )
+
+        with (
+            patch.object(
+                app,
+                "_resolve_persona_system_prompt",
+                new=AsyncMock(return_value="system prompt"),
+            ) as resolve,
+            patch.object(
+                app,
+                "_get_or_create_voice_clone_prompt",
+                new=AsyncMock(return_value=object()),
+            ) as prepare_voice,
+        ):
+            created = await app.create_persona_preparation(request)
+            state = app.persona_preparations[created["id"]]
+            self.assertIsNotNone(state.task)
+            await state.task
+
+        status = await app.get_persona_preparation(created["id"])
+        self.assertEqual(status["status"], "ready")
+        resolve.assert_awaited_once_with(
+            "persona-1", "Morgan", "Changed instructions"
+        )
+        prepare_voice.assert_awaited_once_with(
+            "http://localhost:8090/api/files/personas/new.wav"
+        )
+
+    async def test_voice_replacement_evicts_the_previous_cached_prompt(self):
+        previous_url = "http://localhost:8090/api/files/personas/old.wav"
+        app.app.state.voice_clone_prompts[previous_url] = object()
+        request = app.PersonaPreparationRequest(
+            persona_id="persona-1",
+            persona_name="Morgan",
+            instruction_prompt="Instructions",
+            audio_sample_url="http://localhost:8090/api/files/personas/new.wav",
+            previous_audio_sample_url=previous_url,
+            prepare_voice_clone_prompt=True,
+        )
+
+        with patch.object(
+            app,
+            "_get_or_create_voice_clone_prompt",
+            new=AsyncMock(return_value=object()),
+        ):
+            created = await app.create_persona_preparation(request)
+            await app.persona_preparations[created["id"]].task
+
+        self.assertNotIn(previous_url, app.app.state.voice_clone_prompts)
+        status = await app.get_persona_preparation(created["id"])
+        self.assertEqual(status["status"], "ready")
+
+    async def test_failed_preparation_reports_an_error_without_discarding_state(self):
+        request = app.PersonaPreparationRequest(
+            persona_id="persona-1",
+            persona_name="Morgan",
+            instruction_prompt="Invalid instructions",
+            prepare_system_prompt=True,
+        )
+
+        with patch.object(
+            app,
+            "_resolve_persona_system_prompt",
+            new=AsyncMock(side_effect=RuntimeError("parser unavailable")),
+        ):
+            created = await app.create_persona_preparation(request)
+            await app.persona_preparations[created["id"]].task
+
+        status = await app.get_persona_preparation(created["id"])
+        self.assertEqual(status["status"], "error")
+        self.assertEqual(status["error"], "parser unavailable")
+
+
 class RequestSafetyTests(unittest.TestCase):
     def test_ui_numeric_values_are_unchanged_inside_ranges(self):
         request = app.InitiateRequest(
