@@ -3,6 +3,8 @@ import {
   type CreatePersonaInput,
   listPersonas,
   type PersonaRecord,
+  updatePersona as updatePersonaRecord,
+  type UpdatePersonaInput,
 } from '@/lib/personas'
 import { create } from 'zustand'
 
@@ -26,6 +28,10 @@ interface PersonasState {
   loadError: string | null
   ensurePersonasLoaded: () => Promise<PersonaRecord[]>
   createPersona: (input: CreatePersonaInput) => Promise<PersonaRecord>
+  updatePersona: (
+    personaId: string,
+    input: UpdatePersonaInput
+  ) => Promise<PersonaRecord>
   resetForAuthChange: () => void
   selectPersona: (personaId: string) => void
 }
@@ -88,6 +94,15 @@ export const usePersonasStore = create<PersonasState>((set, get) => ({
       ),
     }))
     get().selectPersona(persona.id)
+    return persona
+  },
+  updatePersona: async (personaId, input) => {
+    const persona = await updatePersonaRecord(personaId, input)
+    set((state) => ({
+      personas: state.personas
+        .map((current) => (current.id === personaId ? persona : current))
+        .sort((first, second) => first.name.localeCompare(second.name)),
+    }))
     return persona
   },
   resetForAuthChange: () => {
