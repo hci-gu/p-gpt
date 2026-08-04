@@ -62,6 +62,14 @@ async def lifespan(app: FastAPI):
     )
     logger.info("OmniVoice warmup took %.2fs", time() - warmup_start)
 
+    logger.info("Computing and caching the default voice clone prompt")
+    default_voice_start = perf_counter()
+    app.state.default_voice_clone_prompt = await _create_default_voice_clone_prompt()
+    logger.info(
+        "Default voice clone prompt computed and cached in %.3fs",
+        perf_counter() - default_voice_start,
+    )
+
     try:
         yield
     finally:
@@ -70,6 +78,7 @@ async def lifespan(app: FastAPI):
             await asyncio.gather(*prompt_tasks, return_exceptions=True)
         app.state.voice_clone_prompts.clear()
         app.state.voice_clone_prompt_tasks.clear()
+        del app.state.default_voice_clone_prompt
         del app.state.tts_model
         del model
         if torch.cuda.is_available():
@@ -99,6 +108,7 @@ OLLAMA_TEXT_MODEL = settings.ollama_text_model
 
 OMNIVOICE_TTS_MODEL = settings.tts_model
 OMNIVOICE_SAMPLE_RATE = 24_000
+DEFAULT_VOICE_REFERENCE_PATH = Path(__file__).parent / "assets" / "default-voice.mp3"
 POCKETBASE_BASE_URL = os.getenv(
     "POCKETBASE_BASE_URL",
     settings.pocketbase_base_url,
@@ -1000,6 +1010,35 @@ async def _prepare_reference_audio(ref_audio: str) -> tuple[torch.Tensor, int]:
     return waveform, sample_rate
 
 
+async def _prepare_default_voice_reference_audio() -> tuple[torch.Tensor, int]:
+    if not DEFAULT_VOICE_REFERENCE_PATH.is_file():
+        raise RuntimeError(
+            "Default voice reference file is missing: "
+            f"{DEFAULT_VOICE_REFERENCE_PATH}"
+        )
+
+    try:
+        audio_array, sample_rate = await asyncio.to_thread(
+            sf.read,
+            DEFAULT_VOICE_REFERENCE_PATH,
+            dtype="float32",
+            always_2d=True,
+        )
+    except (RuntimeError, TypeError, ValueError) as exc:
+        raise RuntimeError("Default voice reference audio could not be decoded.") from exc
+
+    return torch.from_numpy(audio_array.T.copy()), sample_rate
+
+
+async def _create_default_voice_clone_prompt() -> VoiceClonePrompt:
+    reference_audio = await _prepare_default_voice_reference_audio()
+    async with app.state.tts_lock:
+        return await asyncio.to_thread(
+            app.state.tts_model.create_voice_clone_prompt,
+            ref_audio=reference_audio,
+        )
+
+
 async def _create_voice_clone_prompt(ref_audio: str) -> VoiceClonePrompt:
     reference_audio = await _prepare_reference_audio(ref_audio)
     prompt_start = perf_counter()
@@ -1404,6 +1443,8 @@ async def get_initiated_request_audio(request_id: str) -> Response:
                 status_code=502,
                 detail=f"Voice clone preparation failed: {exc}",
             ) from exc
+    elif request.clone_voice:
+        voice_clone_prompt = app.state.default_voice_clone_prompt
 
     if state.cancelled:
         raise HTTPException(status_code=499, detail=CANCELLED_REQUEST_DETAIL)
@@ -1623,6 +1664,8 @@ async def stream_pseudo_stream_audio(request_id: str) -> StreamingResponse:
                 status_code=502,
                 detail=f"Voice clone preparation failed: {exc}",
             ) from exc
+    elif state.request.clone_voice:
+        voice_clone_prompt = app.state.default_voice_clone_prompt
 
     if state.cancelled:
         raise HTTPException(status_code=499, detail=CANCELLED_REQUEST_DETAIL)
