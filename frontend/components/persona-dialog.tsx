@@ -12,10 +12,22 @@ import { Input } from '@/components/ui/input'
 import { Spinner } from '@/components/ui/spinner'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Textarea } from '@/components/ui/textarea'
-import type { PersonaRecord } from '@/lib/personas'
+import {
+  getPersonaPreparation,
+  startPersonaPreparation,
+  type PersonaRecord,
+} from '@/lib/personas'
 import { useChatStore } from '@/src/state/chat'
 import { usePersonasStore } from '@/src/state/personas'
-import { CheckIcon, Music2Icon, PlusIcon, UsersIcon } from 'lucide-react'
+import {
+  CheckIcon,
+  LockKeyholeIcon,
+  Music2Icon,
+  PencilIcon,
+  PlusIcon,
+  SaveIcon,
+  UsersIcon,
+} from 'lucide-react'
 import type { FormEvent } from 'react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 
@@ -43,6 +55,7 @@ export function PersonaDialog({ open, onOpenChange }: PersonaDialogProps) {
     (state) => state.ensurePersonasLoaded
   )
   const createPersona = usePersonasStore((state) => state.createPersona)
+  const updatePersona = usePersonasStore((state) => state.updatePersona)
   const selectPersona = usePersonasStore((state) => state.selectPersona)
   const selectPersonaForNewChat = useChatStore(
     (state) => state.selectPersonaForNewChat
@@ -51,6 +64,15 @@ export function PersonaDialog({ open, onOpenChange }: PersonaDialogProps) {
   const [playingPersonaId, setPlayingPersonaId] = useState<string | null>(null)
   const [isCreating, setIsCreating] = useState(false)
   const [createError, setCreateError] = useState<string | null>(null)
+  const [editingPersona, setEditingPersona] = useState<PersonaRecord | null>(
+    null
+  )
+  const [isSaving, setIsSaving] = useState(false)
+  const [editError, setEditError] = useState<string | null>(null)
+  const [preparationId, setPreparationId] = useState<string | null>(null)
+  const [preparationMessage, setPreparationMessage] = useState<string | null>(
+    null
+  )
   const audioRef = useRef<HTMLAudioElement | null>(null)
 
   useEffect(() => {
@@ -66,6 +88,57 @@ export function PersonaDialog({ open, onOpenChange }: PersonaDialogProps) {
     },
     []
   )
+
+  useEffect(() => {
+    if (!preparationId) {
+      return undefined
+    }
+
+    let isCurrent = true
+    let timeoutId: number | null = null
+
+    const poll = async () => {
+      try {
+        const preparation = await getPersonaPreparation(preparationId)
+        if (!isCurrent) {
+          return
+        }
+
+        if (preparation.status === 'pending') {
+          timeoutId = window.setTimeout(poll, 1000)
+          return
+        }
+
+        setPreparationId(null)
+        setPreparationMessage(
+          preparation.status === 'ready'
+            ? 'Persona changes are ready to use.'
+            : `Changes were saved, but preparation failed: ${
+                preparation.error ?? 'unknown error'
+              }. It will retry when the persona is used.`
+        )
+      } catch (error) {
+        if (!isCurrent) {
+          return
+        }
+        setPreparationId(null)
+        setPreparationMessage(
+          `Changes were saved, but preparation could not be checked: ${
+            error instanceof Error ? error.message : 'it will retry when used.'
+          }. It will retry when the persona is used.`
+        )
+      }
+    }
+
+    void poll()
+
+    return () => {
+      isCurrent = false
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId)
+      }
+    }
+  }, [preparationId])
 
   const handleSelectPersona = useCallback(
     (personaId: string) => {
@@ -145,6 +218,97 @@ export function PersonaDialog({ open, onOpenChange }: PersonaDialogProps) {
     [createPersona, onOpenChange, selectPersonaForNewChat]
   )
 
+  const handleEditPersona = useCallback(
+    async (event: FormEvent<HTMLFormElement>) => {
+      event.preventDefault()
+      if (!editingPersona) {
+        return
+      }
+
+      const originalPersona = editingPersona
+      const data = new FormData(event.currentTarget)
+      const profilePicture = data.get('profile_picture')
+      const audioSample = data.get('audio_sample')
+      const name = String(data.get('name') ?? '').trim()
+      const description = String(data.get('description') ?? '').trim()
+      const instructionPrompt = String(
+        data.get('instruction_prompt') ?? ''
+      ).trim()
+      const replacementAudioSample =
+        audioSample instanceof File && audioSample.size > 0
+          ? audioSample
+          : null
+      const prepareSystemPrompt =
+        name !== originalPersona.name ||
+        instructionPrompt !== originalPersona.instructionPrompt
+      const prepareVoiceClonePrompt = Boolean(replacementAudioSample)
+
+      setIsSaving(true)
+      setEditError(null)
+      setPreparationId(null)
+      setPreparationMessage(null)
+
+      try {
+        const persona = await updatePersona(originalPersona.id, {
+          name,
+          description,
+          instructionPrompt,
+          profilePicture:
+            profilePicture instanceof File && profilePicture.size > 0
+              ? profilePicture
+              : null,
+          audioSample: replacementAudioSample,
+        })
+        setEditingPersona(persona)
+
+        if (prepareSystemPrompt || prepareVoiceClonePrompt) {
+          try {
+            const preparation = await startPersonaPreparation({
+              personaId: persona.id,
+              name: persona.name,
+              instructionPrompt: persona.instructionPrompt,
+              previousAudioSampleUrl: originalPersona.audioSampleUrl,
+              audioSampleUrl: persona.audioSampleUrl,
+              prepareSystemPrompt,
+              prepareVoiceClonePrompt,
+            })
+            setPreparationId(
+              preparation.status === 'pending' ? preparation.id : null
+            )
+            setPreparationMessage(
+              preparation.status === 'pending'
+                ? 'Changes saved. Preparing the updated persona…'
+                : 'Persona changes are ready to use.'
+            )
+          } catch (error) {
+            setPreparationMessage(
+              `Changes were saved, but preparation could not start: ${
+                error instanceof Error ? error.message : 'unknown error'
+              }. It will retry when the persona is used.`
+            )
+          }
+        } else {
+          setPreparationMessage('Changes saved.')
+        }
+      } catch (error) {
+        setEditError(
+          error instanceof Error ? error.message : 'Could not save persona.'
+        )
+      } finally {
+        setIsSaving(false)
+      }
+    },
+    [editingPersona, updatePersona]
+  )
+
+  const handleStartEditing = useCallback((persona: PersonaRecord) => {
+    setEditingPersona(persona)
+    setEditError(null)
+    setPreparationId(null)
+    setPreparationMessage(null)
+    setActiveTab('edit')
+  }, [])
+
   return (
     <Dialog onOpenChange={onOpenChange} open={open}>
       <DialogContent className="max-h-[88vh] overflow-hidden sm:max-w-3xl">
@@ -156,7 +320,9 @@ export function PersonaDialog({ open, onOpenChange }: PersonaDialogProps) {
         </DialogHeader>
 
         <Tabs onValueChange={setActiveTab} value={activeTab}>
-          <TabsList className="grid w-full grid-cols-2">
+          <TabsList
+            className={`grid w-full ${editingPersona ? 'grid-cols-3' : 'grid-cols-2'}`}
+          >
             <TabsTrigger value="choose">
               <UsersIcon />
               Choose persona
@@ -165,6 +331,12 @@ export function PersonaDialog({ open, onOpenChange }: PersonaDialogProps) {
               <PlusIcon />
               Create persona
             </TabsTrigger>
+            {editingPersona && (
+              <TabsTrigger value="edit">
+                <PencilIcon />
+                Edit persona
+              </TabsTrigger>
+            )}
           </TabsList>
 
           <TabsContent className="min-h-0" value="choose">
@@ -213,7 +385,7 @@ export function PersonaDialog({ open, onOpenChange }: PersonaDialogProps) {
                     >
                       <button
                         aria-pressed={isSelected}
-                        className="flex min-h-24 w-full items-center gap-3 p-3 pr-12 text-left outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+                        className="flex min-h-24 w-full items-center gap-3 p-3 pr-12 pb-12 text-left outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
                         onClick={() => handleSelectPersona(persona.id)}
                         type="button"
                       >
@@ -269,6 +441,28 @@ export function PersonaDialog({ open, onOpenChange }: PersonaDialogProps) {
                             <Music2Icon
                               className={isPlaying ? 'animate-pulse' : undefined}
                             />
+                          </Button>
+                        )}
+                      </div>
+                      <div className="absolute right-2 bottom-2">
+                        {persona.isDefault ? (
+                          <span
+                            aria-label="Default personas cannot be edited"
+                            className="flex size-8 items-center justify-center rounded-md border bg-muted/50 text-muted-foreground"
+                            title="Default personas cannot be edited"
+                          >
+                            <LockKeyholeIcon className="size-4" />
+                          </span>
+                        ) : (
+                          <Button
+                            aria-label={`Edit ${persona.name}`}
+                            onClick={() => handleStartEditing(persona)}
+                            size="icon-sm"
+                            title={`Edit ${persona.name}`}
+                            type="button"
+                            variant="outline"
+                          >
+                            <PencilIcon />
                           </Button>
                         )}
                       </div>
@@ -353,6 +547,121 @@ export function PersonaDialog({ open, onOpenChange }: PersonaDialogProps) {
               </div>
             </form>
           </TabsContent>
+
+          {editingPersona && (
+            <TabsContent className="min-h-0 overflow-y-auto" value="edit">
+              <form
+                className="grid gap-4"
+                key={`${editingPersona.id}-${editingPersona.updated}`}
+                onSubmit={handleEditPersona}
+              >
+                <label className="grid gap-1.5">
+                  <span className="font-medium">Name</span>
+                  <Input
+                    autoComplete="off"
+                    defaultValue={editingPersona.name}
+                    minLength={3}
+                    name="name"
+                    required
+                  />
+                </label>
+
+                <label className="grid gap-1.5">
+                  <span className="font-medium">Description</span>
+                  <Input
+                    autoComplete="off"
+                    defaultValue={editingPersona.description}
+                    name="description"
+                  />
+                </label>
+
+                <label className="grid gap-1.5">
+                  <span className="font-medium">Instruction prompt</span>
+                  <Textarea
+                    className="min-h-28"
+                    defaultValue={editingPersona.instructionPrompt}
+                    name="instruction_prompt"
+                    required
+                  />
+                </label>
+
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <label className="grid gap-1.5">
+                    <span className="font-medium">Profile picture</span>
+                    <Input
+                      accept="image/png,image/jpeg,image/webp"
+                      className="h-auto py-1"
+                      name="profile_picture"
+                      type="file"
+                    />
+                    {editingPersona.profilePictureUrl && (
+                      <img
+                        alt={`${editingPersona.name} current profile`}
+                        className="size-14 rounded-full border object-cover"
+                        src={editingPersona.profilePictureUrl}
+                      />
+                    )}
+                    <span className="text-[10px] text-muted-foreground">
+                      {editingPersona.profilePictureUrl
+                        ? 'Current image will remain unless replaced.'
+                        : 'Optional PNG, JPG, or WebP.'}
+                    </span>
+                  </label>
+
+                  <label className="grid gap-1.5">
+                    <span className="font-medium">Audio sample</span>
+                    <Input
+                      accept="audio/mpeg,audio/wav,.mp3,.wav"
+                      className="h-auto py-1"
+                      name="audio_sample"
+                      type="file"
+                    />
+                    {editingPersona.audioSampleUrl && (
+                      <audio
+                        className="h-8 w-full"
+                        controls
+                        src={editingPersona.audioSampleUrl}
+                      >
+                        Current audio sample
+                      </audio>
+                    )}
+                    <span className="text-[10px] text-muted-foreground">
+                      {editingPersona.audioSampleUrl
+                        ? 'Current audio will remain unless replaced.'
+                        : 'Optional MP3 or WAV.'}
+                    </span>
+                  </label>
+                </div>
+
+                {editError && (
+                  <p className="text-destructive" role="alert">
+                    {editError}
+                  </p>
+                )}
+                {preparationMessage && (
+                  <p
+                    className={
+                      preparationMessage.includes('failed') ||
+                      preparationMessage.includes('could not')
+                        ? 'text-amber-700 dark:text-amber-400'
+                        : 'text-muted-foreground'
+                    }
+                    role="status"
+                  >
+                    {preparationId && <Spinner className="mr-2 inline-flex" />}
+                    {preparationMessage}
+                  </p>
+                )}
+
+                <div className="flex justify-end">
+                  <Button disabled={isSaving} type="submit">
+                    {isSaving ? <Spinner /> : <SaveIcon />}
+                    Save changes
+                  </Button>
+                </div>
+              </form>
+            </TabsContent>
+          )}
         </Tabs>
       </DialogContent>
     </Dialog>

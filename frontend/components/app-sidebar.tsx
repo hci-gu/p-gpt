@@ -368,11 +368,11 @@ export function AppSidebar(props: ComponentProps<typeof Sidebar>) {
                   type="button"
                 >
                   <div className="aspect-[16/10] overflow-hidden bg-white">
-                    {background.url ? (
+                    {background.thumbnailUrl ? (
                       <img
                         alt=""
                         className="size-full object-cover transition-transform duration-200 group-hover/background:scale-105"
-                        src={background.url}
+                        src={background.thumbnailUrl}
                       />
                     ) : (
                       <div className="size-full bg-white" />

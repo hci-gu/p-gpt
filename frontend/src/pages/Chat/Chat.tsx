@@ -164,6 +164,8 @@ const ChatPage = () => {
   const [ttsVolume, setTtsVolume] = useState(DEFAULT_TTS_VOLUME)
   const [isAssistantAudioPlaying, setIsAssistantAudioPlaying] = useState(false)
   const [assistantAudioLevel, setAssistantAudioLevel] = useState(0)
+  const [completedAssistantMessageId, setCompletedAssistantMessageId] =
+    useState<string | null>(null)
   const transcriptionAnimationRef = useRef<number | null>(null)
 
   const handleSubmit = useCallback(
@@ -371,12 +373,17 @@ const ChatPage = () => {
                             onEnded={() => {
                               setIsAssistantAudioPlaying(false)
                               setAssistantAudioLevel(0)
+                              setCompletedAssistantMessageId(version.id)
                               completeAssistantResponse(version.id)
                             }}
-                            onError={() => {
+                            onError={(errorMessage) => {
                               setIsAssistantAudioPlaying(false)
                               setAssistantAudioLevel(0)
-                              failAssistantResponse(version.id)
+                              failAssistantResponse(
+                                version.id,
+                                errorMessage,
+                                true
+                              )
                             }}
                             src={version.audioUrl}
                             volume={ttsVolume}
@@ -388,7 +395,8 @@ const ChatPage = () => {
                           />
                         ) : message.from === 'assistant' &&
                           version.audioPlaybackComplete &&
-                          version.contentStatus === 'ready' ? (
+                          version.contentStatus === 'ready' &&
+                          version.id === completedAssistantMessageId ? (
                           <AnimatedMessageResponse content={version.content} />
                         ) : (
                           <MessageResponse>

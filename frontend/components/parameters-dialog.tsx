@@ -1,4 +1,5 @@
 import { Button } from '@/components/ui/button'
+import { asrModels } from '@/src/lib/asr-models'
 import {
   Dialog,
   DialogContent,
@@ -17,6 +18,7 @@ import {
 import { Slider } from '@/components/ui/slider'
 import { Switch } from '@/components/ui/switch'
 import {
+  conversationModels,
   defaultGenerationParameters,
   omnivoiceNumStepsFromLevel,
   usePreferencesStore,
@@ -70,7 +72,6 @@ export function ParametersDialog({
   const resetParameters = usePreferencesStore(
     (state) => state.resetGenerationParameters
   )
-
   return (
     <Dialog onOpenChange={onOpenChange} open={open}>
       <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-xl">
@@ -82,6 +83,56 @@ export function ParametersDialog({
         </DialogHeader>
 
         <div className="grid gap-3">
+          <section className="grid gap-3 rounded-lg border bg-muted/15 p-4">
+            <div>
+              <h3 className="font-medium">Conversation model</h3>
+              <p className="text-muted-foreground">
+                Choose the model used for assistant responses.
+              </p>
+            </div>
+            <Select
+              onValueChange={(model) =>
+                setParameter('model', model as typeof parameters.model)
+              }
+              value={parameters.model}
+            >
+              <SelectTrigger aria-label="Conversation model" className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {conversationModels.map((model) => (
+                  <SelectItem key={model} value={model}>
+                    {model}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </section>
+
+          <section className="grid gap-3 rounded-lg border bg-muted/15 p-4">
+            <div>
+              <h3 className="font-medium">Speech recognition model</h3>
+              <p className="text-muted-foreground">
+                Choose the Whisper model used to transcribe microphone input.
+              </p>
+            </div>
+            <Select
+              onValueChange={(model) => setParameter('asrModel', model as typeof parameters.asrModel)}
+              value={parameters.asrModel}
+            >
+              <SelectTrigger aria-label="Speech recognition model" className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {asrModels.map((model) => (
+                  <SelectItem key={model} value={model}>
+                    Whisper {model}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </section>
+
           <section className="grid gap-3 rounded-lg border bg-muted/15 p-4">
             <div className="flex items-start justify-between gap-4">
               <div>
@@ -309,6 +360,8 @@ export function ParametersDialog({
             disabled={
               parameters.temperature ===
                 defaultGenerationParameters.temperature &&
+              parameters.model === defaultGenerationParameters.model &&
+              parameters.asrModel === defaultGenerationParameters.asrModel &&
               parameters.cloneVoice === defaultGenerationParameters.cloneVoice &&
               parameters.maxNewTokens ===
                 defaultGenerationParameters.maxNewTokens &&

@@ -17,6 +17,13 @@ For CUDA compatible device, run
 uv sync --extra cuda
 ```
 
+Optionally create `backend/.env` to configure persona extraction retries and
+the backend-owned SQLite prompt cache.
+``` env
+P_GPT_N_RETRIES=3
+P_GPT_PERSONA_PROMPT_CACHE_PATH=persona_prompt_cache.sqlite3
+```
+
 To spin up the FastAPI server
 ``` bash
 fastapi dev

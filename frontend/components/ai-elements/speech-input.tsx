@@ -3,6 +3,7 @@
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { cn } from "@/lib/utils";
+import { usePreferencesStore } from "@/src/state/preferences";
 import { LanguagesIcon, MicIcon, SquareIcon } from "lucide-react";
 import type { ComponentProps } from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -119,6 +120,9 @@ export const SpeechInput = ({
   ...props
 }: SpeechInputProps) => {
   const [language, setLanguage] = useState<SpeechLanguage>(defaultLanguage);
+  const asrModel = usePreferencesStore(
+    (state) => state.generationParameters.asrModel
+  );
   const [status, setStatus] = useState<SpeechInputStatus>("idle");
   const [isSupported] = useState(isSpeechInputSupported);
   const audioContextRef = useRef<AudioContext | null>(null);
@@ -276,7 +280,11 @@ export const SpeechInput = ({
       const worker = getWorker();
       const sessionId = createSessionId();
       sessionIdRef.current = sessionId;
-      worker.postMessage({ language, type: "init" } satisfies AsrWorkerRequest);
+      worker.postMessage({
+        language,
+        model: asrModel,
+        type: "init",
+      } satisfies AsrWorkerRequest);
       onTranscriptionStartRef.current?.(sessionId);
 
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -345,7 +353,7 @@ export const SpeechInput = ({
         error instanceof Error ? error.message : "Could not start recording."
       );
     }
-  }, [cleanupAudio, getWorker, isSupported, language, sendTranscriptionWindow, status]);
+  }, [asrModel, cleanupAudio, getWorker, isSupported, language, sendTranscriptionWindow, status]);
 
   const stopRecording = useCallback(async () => {
     if (!isRecordingRef.current) {

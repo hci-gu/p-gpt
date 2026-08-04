@@ -1,10 +1,12 @@
 import { pipeline } from '@huggingface/transformers'
+import { asrModelIds, defaultAsrModel, type AsrModel } from '@/src/lib/asr-models'
 
 export type SpeechLanguage = 'en' | 'sv'
 
 export type AsrWorkerRequest =
   | {
       language: SpeechLanguage
+      model: AsrModel
       type: 'init'
     }
   | {
@@ -52,11 +54,11 @@ type AsrPipeline = (
   }
 ) => Promise<{ text: string } | { text: string }[]>
 
-const modelId = 'onnx-community/whisper-tiny'
 const targetSampleRate = 16_000
 const dtypeCandidates: AsrDtype[] = ['q4', 'q8', 'fp16', 'fp32']
 
 let currentLanguage: SpeechLanguage = 'en'
+let currentModel: AsrModel = defaultAsrModel
 let loadPromise: Promise<void> | null = null
 let transcriber: AsrPipeline | null = null
 let selectedDevice: AsrDevice | null = null
@@ -74,7 +76,7 @@ const getErrorMessage = (error: unknown) =>
 const getDeviceCandidates = (): AsrDevice[] =>
   'gpu' in navigator ? ['webgpu', 'wasm'] : ['wasm']
 
-const createPipeline = async () => {
+const createPipeline = async (model: AsrModel) => {
   let lastError: unknown = null
 
   for (const device of getDeviceCandidates()) {
@@ -82,7 +84,7 @@ const createPipeline = async () => {
       try {
         const candidate = await pipeline(
           'automatic-speech-recognition',
-          modelId,
+          asrModelIds[model],
           { device, dtype }
         )
 
@@ -101,7 +103,7 @@ const createPipeline = async () => {
 
 const ensurePipeline = async () => {
   if (!loadPromise) {
-    loadPromise = createPipeline().then(() => {
+    loadPromise = createPipeline(currentModel).then(() => {
       if (!(selectedDevice && selectedDtype)) {
         throw new Error('ASR model loaded without device metadata.')
       }
@@ -115,6 +117,18 @@ const ensurePipeline = async () => {
   }
 
   await loadPromise
+}
+
+const selectModel = (model: AsrModel) => {
+  if (model === currentModel) {
+    return
+  }
+
+  currentModel = model
+  loadPromise = null
+  selectedDevice = null
+  selectedDtype = null
+  transcriber = null
 }
 
 const getOutputText = (output: { text: string } | { text: string }[]) => {
@@ -196,6 +210,7 @@ self.addEventListener('message', (event: MessageEvent<AsrWorkerRequest>) => {
 
   if (message.type === 'init') {
     currentLanguage = message.language
+    selectModel(message.model)
     void ensurePipeline().catch((error) => {
       postWorkerMessage({
         error: getErrorMessage(error),

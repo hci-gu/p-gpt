@@ -1,5 +1,6 @@
 export type PersonaRecord = {
   id: string
+  isDefault: boolean
   name: string
   description: string
   instructionPrompt: string
@@ -18,6 +19,29 @@ export type CreatePersonaInput = {
   profilePicture?: File | null
   audioSample?: File | null
 }
+
+export type UpdatePersonaInput = CreatePersonaInput
+
+export type PersonaPreparationInput = {
+  personaId: string
+  name: string
+  instructionPrompt: string
+  previousAudioSampleUrl?: string | null
+  audioSampleUrl?: string | null
+  prepareSystemPrompt: boolean
+  prepareVoiceClonePrompt: boolean
+}
+
+export type PersonaPreparation = {
+  id: string
+  status: 'pending' | 'ready' | 'error'
+  error: string | null
+}
+
+const apiEndpoint = (import.meta.env.VITE_API_ENDPOINT ?? 'http://127.0.0.1:8000').replace(
+  /\/$/,
+  ''
+)
 
 const parsePersona = (value: unknown): PersonaRecord | null => {
   if (
@@ -43,6 +67,10 @@ const parsePersona = (value: unknown): PersonaRecord | null => {
 
   return {
     id: value.id,
+    isDefault:
+      !('owner' in value) ||
+      typeof value.owner !== 'string' ||
+      value.owner.length === 0,
     name: value.name,
     description:
       'description' in value && typeof value.description === 'string'
@@ -106,6 +134,104 @@ export const createPersona = async (input: CreatePersonaInput) => {
   }
 
   return persona
+}
+
+export const updatePersona = async (
+  personaId: string,
+  input: UpdatePersonaInput
+) => {
+  const body = new FormData()
+  body.set('name', input.name.trim())
+  body.set('description', input.description.trim())
+  body.set('instruction_prompt', input.instructionPrompt.trim())
+
+  if (input.profilePicture) {
+    body.set('profile_picture', input.profilePicture)
+  }
+  if (input.audioSample) {
+    body.set('audio_sample', input.audioSample)
+  }
+
+  const response = await pb.collection('personas').update(personaId, body)
+  const persona = parsePersona(response)
+  if (!persona) {
+    throw new Error('PocketBase returned an invalid persona record.')
+  }
+
+  return persona
+}
+
+const parsePreparation = (value: unknown): PersonaPreparation => {
+  if (
+    typeof value !== 'object' ||
+    value === null ||
+    !('id' in value) ||
+    typeof value.id !== 'string' ||
+    !('status' in value) ||
+    (value.status !== 'pending' && value.status !== 'ready' && value.status !== 'error')
+  ) {
+    throw new Error('Backend returned an invalid persona preparation status.')
+  }
+
+  return {
+    id: value.id,
+    status: value.status,
+    error: 'error' in value && typeof value.error === 'string' ? value.error : null,
+  }
+}
+
+const getPreparationError = async (response: Response) => {
+  try {
+    const payload: unknown = await response.json()
+    if (
+      typeof payload === 'object' &&
+      payload !== null &&
+      'detail' in payload &&
+      typeof payload.detail === 'string'
+    ) {
+      return payload.detail
+    }
+  } catch {
+    // Fall back to the generic error below.
+  }
+
+  return 'Could not prepare persona changes.'
+}
+
+export const startPersonaPreparation = async (
+  input: PersonaPreparationInput
+) => {
+  const response = await fetch(`${apiEndpoint}/persona-preparations`, {
+    body: JSON.stringify({
+      audio_sample_url: input.audioSampleUrl ?? null,
+      instruction_prompt: input.instructionPrompt,
+      persona_id: input.personaId,
+      persona_name: input.name,
+      prepare_system_prompt: input.prepareSystemPrompt,
+      prepare_voice_clone_prompt: input.prepareVoiceClonePrompt,
+      previous_audio_sample_url: input.previousAudioSampleUrl ?? null,
+    }),
+    headers: { 'Content-Type': 'application/json' },
+    method: 'POST',
+  })
+
+  if (!response.ok) {
+    throw new Error(await getPreparationError(response))
+  }
+
+  return parsePreparation(await response.json())
+}
+
+export const getPersonaPreparation = async (preparationId: string) => {
+  const response = await fetch(
+    `${apiEndpoint}/persona-preparations/${encodeURIComponent(preparationId)}`
+  )
+
+  if (!response.ok) {
+    throw new Error(await getPreparationError(response))
+  }
+
+  return parsePreparation(await response.json())
 }
 import { pb } from '@/lib/pocketbase'
 import type { RecordModel } from 'pocketbase'
