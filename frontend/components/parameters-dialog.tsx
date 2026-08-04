@@ -1,4 +1,5 @@
 import { Button } from '@/components/ui/button'
+import { asrModels } from '@/src/lib/asr-models'
 import {
   Dialog,
   DialogContent,
@@ -16,13 +17,12 @@ import {
 } from '@/components/ui/select'
 import { Slider } from '@/components/ui/slider'
 import { Switch } from '@/components/ui/switch'
-import { listOllamaModels, type OllamaModels } from '@/lib/ollama-models'
 import {
+  conversationModels,
   defaultGenerationParameters,
   omnivoiceNumStepsFromLevel,
   usePreferencesStore,
 } from '@/src/state/preferences'
-import { useEffect, useState } from 'react'
 
 type ParametersDialogProps = {
   open: boolean
@@ -72,43 +72,6 @@ export function ParametersDialog({
   const resetParameters = usePreferencesStore(
     (state) => state.resetGenerationParameters
   )
-  const [ollamaModels, setOllamaModels] = useState<OllamaModels | null>(null)
-  const [modelError, setModelError] = useState<string | null>(null)
-
-  useEffect(() => {
-    if (!open) {
-      return
-    }
-
-    let cancelled = false
-    setModelError(null)
-
-    void listOllamaModels()
-      .then((result) => {
-        if (cancelled) {
-          return
-        }
-
-        setOllamaModels(result)
-        const selectedModel =
-          usePreferencesStore.getState().generationParameters.model
-        if (selectedModel && !result.models.includes(selectedModel)) {
-          setParameter('model', result.defaultModel)
-        }
-      })
-      .catch((error: unknown) => {
-        if (!cancelled) {
-          setModelError(
-            error instanceof Error ? error.message : 'Model discovery failed.'
-          )
-        }
-      })
-
-    return () => {
-      cancelled = true
-    }
-  }, [open, setParameter])
-
   return (
     <Dialog onOpenChange={onOpenChange} open={open}>
       <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-xl">
@@ -124,37 +87,50 @@ export function ParametersDialog({
             <div>
               <h3 className="font-medium">Conversation model</h3>
               <p className="text-muted-foreground">
-                Choose an installed Ollama model for assistant responses.
+                Choose the model used for assistant responses.
               </p>
             </div>
             <Select
-              disabled={!ollamaModels}
-              onValueChange={(model) => setParameter('model', model)}
-              value={
-                ollamaModels
-                  ? (parameters.model ?? ollamaModels.defaultModel)
-                  : undefined
+              onValueChange={(model) =>
+                setParameter('model', model as typeof parameters.model)
               }
+              value={parameters.model}
             >
               <SelectTrigger aria-label="Conversation model" className="w-full">
-                <SelectValue placeholder="Loading models..." />
+                <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                {ollamaModels?.models.map((model) => (
+                {conversationModels.map((model) => (
                   <SelectItem key={model} value={model}>
                     {model}
                   </SelectItem>
                 ))}
               </SelectContent>
             </Select>
-            {ollamaModels?.usedFallback && (
-              <p className="text-amber-700 text-xs dark:text-amber-400">
-                Ollama model discovery failed. Using the configured default.
+          </section>
+
+          <section className="grid gap-3 rounded-lg border bg-muted/15 p-4">
+            <div>
+              <h3 className="font-medium">Speech recognition model</h3>
+              <p className="text-muted-foreground">
+                Choose the Whisper model used to transcribe microphone input.
               </p>
-            )}
-            {modelError && (
-              <p className="text-destructive text-xs">{modelError}</p>
-            )}
+            </div>
+            <Select
+              onValueChange={(model) => setParameter('asrModel', model as typeof parameters.asrModel)}
+              value={parameters.asrModel}
+            >
+              <SelectTrigger aria-label="Speech recognition model" className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {asrModels.map((model) => (
+                  <SelectItem key={model} value={model}>
+                    Whisper {model}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
           </section>
 
           <section className="grid gap-3 rounded-lg border bg-muted/15 p-4">
@@ -385,6 +361,7 @@ export function ParametersDialog({
               parameters.temperature ===
                 defaultGenerationParameters.temperature &&
               parameters.model === defaultGenerationParameters.model &&
+              parameters.asrModel === defaultGenerationParameters.asrModel &&
               parameters.cloneVoice === defaultGenerationParameters.cloneVoice &&
               parameters.maxNewTokens ===
                 defaultGenerationParameters.maxNewTokens &&

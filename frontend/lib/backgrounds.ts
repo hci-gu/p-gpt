@@ -2,9 +2,16 @@ export type BackgroundOption = {
   id: string
   label: string
   url: string | null
+  thumbnailUrl: string | null
 }
 
 const backgroundModules = import.meta.glob('../assets/background*.png', {
+  eager: true,
+  import: 'default',
+  query: '?url',
+}) as Record<string, string>
+
+const thumbnailModules = import.meta.glob('../assets/thumbnails/background*.png', {
   eager: true,
   import: 'default',
   query: '?url',
@@ -23,15 +30,21 @@ const numberedBackgrounds = Object.entries(backgroundModules)
         id: `background${number}`,
         label: `Background ${number}`,
         number,
+        thumbnailUrl: thumbnailModules[`../assets/thumbnails/background${number}.png`],
         url,
       },
     ]
   })
   .sort((first, second) => first.number - second.number)
-  .map(({ id, label, url }) => ({ id, label, url }))
+  .map(({ id, label, thumbnailUrl, url }) => ({
+    id,
+    label,
+    thumbnailUrl,
+    url,
+  }))
 
 export const backgroundOptions: BackgroundOption[] = [
-  { id: 'none', label: 'No background', url: null },
+  { id: 'none', label: 'No background', thumbnailUrl: null, url: null },
   ...numberedBackgrounds,
 ]
 

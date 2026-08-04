@@ -1,11 +1,16 @@
 import { backgroundOptions, defaultBackgroundId } from '@/lib/backgrounds'
+import { asrModels, defaultAsrModel, type AsrModel } from '@/src/lib/asr-models'
 import { create } from 'zustand'
 
 const backgroundStorageKey = 'p-gpt-background'
 const parametersStorageKey = 'p-gpt-generation-parameters'
+export const conversationModels = ['gemma4:e4b', 'gemma4:e2b', 'gemma4:31b'] as const
+export type ConversationModel = (typeof conversationModels)[number]
+export const defaultConversationModel: ConversationModel = 'gemma4:e4b'
 
 export type GenerationParameters = {
-  model: string | null
+  asrModel: AsrModel
+  model: ConversationModel
   temperature: number
   cloneVoice: boolean
   maxNewTokens: number
@@ -19,7 +24,8 @@ export const omnivoiceNumStepsFromLevel = (level: number) =>
   Math.round(22 + ((Math.min(10, Math.max(1, level)) - 1) * 10) / 9)
 
 export const defaultGenerationParameters: GenerationParameters = {
-  model: null,
+  asrModel: defaultAsrModel,
+  model: defaultConversationModel,
   temperature: 1,
   cloneVoice: true,
   maxNewTokens: 256,
@@ -62,9 +68,17 @@ const getInitialGenerationParameters = (): GenerationParameters => {
         ? Math.min(2, Math.max(0, parsed.temperature))
         : defaultGenerationParameters.temperature
     const model =
-      'model' in parsed && typeof parsed.model === 'string' && parsed.model.trim()
-        ? parsed.model
+      'model' in parsed &&
+      typeof parsed.model === 'string' &&
+      conversationModels.includes(parsed.model as ConversationModel)
+        ? (parsed.model as ConversationModel)
         : defaultGenerationParameters.model
+    const asrModel =
+      'asrModel' in parsed &&
+      typeof parsed.asrModel === 'string' &&
+      asrModels.includes(parsed.asrModel as AsrModel)
+        ? (parsed.asrModel as AsrModel)
+        : defaultGenerationParameters.asrModel
     const cloneVoice =
       'cloneVoice' in parsed && typeof parsed.cloneVoice === 'boolean'
         ? parsed.cloneVoice
@@ -97,6 +111,7 @@ const getInitialGenerationParameters = (): GenerationParameters => {
         : defaultGenerationParameters.seed
 
     return {
+      asrModel,
       cloneVoice,
       maxNewTokens,
       model,
