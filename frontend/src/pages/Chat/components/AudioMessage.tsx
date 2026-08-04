@@ -99,6 +99,12 @@ export const AudioMessage = ({
   onPlaybackStartRef.current = onPlaybackStart
 
   useEffect(() => {
+    if (hasStartedPlaybackRef.current && !hasFinishedRef.current) {
+      onPlaybackStart?.()
+    }
+  }, [onPlaybackStart])
+
+  useEffect(() => {
     const gainNode = gainNodeRef.current
 
     if (gainNode) {
