@@ -34,6 +34,7 @@ export interface MessageType {
     id: string
     content: string
     contentStatus?: 'pending' | 'ready' | 'error'
+    finishReason?: 'interrupted'
     audioError?: string
     audioPlaybackComplete?: boolean
     audioUrl?: string
@@ -72,6 +73,9 @@ const toChatHistory = (messages: MessageType[]): StoredChatMessage[] =>
       .filter((version) => version.contentStatus !== 'error')
       .map((version) => ({
         content: version.content.trim(),
+        ...(version.finishReason
+          ? { finishReason: version.finishReason }
+          : {}),
         role: message.from,
       }))
       .filter((message) => message.content)
@@ -218,6 +222,7 @@ const toMessageTypes = (conversation: StoredChatMessage[]): MessageType[] =>
           audioPlaybackComplete: true,
           content: message.content,
           contentStatus: 'ready',
+          finishReason: message.finishReason,
           id: messageId,
         },
       ],
@@ -273,6 +278,12 @@ interface ChatState {
   ) => void
   selectPersonaForNewChat: (personaId: string) => void
   addUserMessage: (content: string) => void
+  commitSpeakerUserMessage: (content: string) => void
+  commitSpeakerAssistantMessage: (
+    content: string,
+    finishReason?: 'interrupted'
+  ) => void
+  getConversationHistory: () => StoredChatMessage[]
   submitMessage: (content: string) => void
 }
 
@@ -772,6 +783,50 @@ export const useChatStore = create<ChatState>((set, get) => ({
     get().persistConversation(history)
     void get().fetchAssistantResponse(assistantMessageId, history)
   },
+  commitSpeakerUserMessage: (content) => {
+    const cleanContent = content.trim()
+    if (!cleanContent) {
+      return
+    }
+    const messageId = createMessageId('user')
+    const message: MessageType = {
+      from: 'user',
+      key: messageId,
+      versions: [
+        {
+          audioPlaybackComplete: true,
+          content: cleanContent,
+          contentStatus: 'ready',
+          id: messageId,
+        },
+      ],
+    }
+    set((state) => ({ messages: [...state.messages, message] }))
+    get().persistConversation(toChatHistory(get().messages))
+  },
+  commitSpeakerAssistantMessage: (content, finishReason) => {
+    const cleanContent = content.trim()
+    if (!cleanContent) {
+      return
+    }
+    const messageId = createMessageId('assistant')
+    const message: MessageType = {
+      from: 'assistant',
+      key: messageId,
+      versions: [
+        {
+          audioPlaybackComplete: true,
+          content: cleanContent,
+          contentStatus: 'ready',
+          finishReason,
+          id: messageId,
+        },
+      ],
+    }
+    set((state) => ({ messages: [...state.messages, message] }))
+    get().persistConversation(toChatHistory(get().messages))
+  },
+  getConversationHistory: () => toChatHistory(get().messages),
   submitMessage: (content) => {
     set({ status: 'submitted', text: '' })
     get().addUserMessage(content)

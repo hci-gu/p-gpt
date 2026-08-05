@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     inference_host: str = "100.113.76.118"
     ollama_text_model: str = "gemma4:e4b"
     tts_model: str = "k2-fsa/OmniVoice"
+    speaker_asr_model: str = "nvidia/parakeet-tdt-0.6b-v3"
     vllm_tts_model: str = "mistralai/Voxtral-4B-TTS-2603"
     pocketbase_base_url: str = "http://127.0.0.1:8090"
     persona_prompt_cache_path: str = str(

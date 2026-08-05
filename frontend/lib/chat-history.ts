@@ -1,6 +1,7 @@
 export type StoredChatMessage = {
   role: 'user' | 'assistant' | 'system'
   content: string
+  finishReason?: 'interrupted'
 }
 
 export type ChatHistoryRecord = {
@@ -47,7 +48,12 @@ const parseConversation = (value: unknown): StoredChatMessage[] => {
       return []
     }
 
-    return [{ role, content }]
+    const finishReason =
+      'finishReason' in message && message.finishReason === 'interrupted'
+        ? 'interrupted'
+        : undefined
+
+    return [{ role, content, ...(finishReason ? { finishReason } : {}) }]
   })
 }
 

@@ -1,6 +1,7 @@
 import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 import hashlib
 from io import BytesIO
 import mlflow
@@ -20,7 +21,7 @@ from config import settings
 import httpx
 import soundfile as sf
 import torch
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from omnivoice import OmniVoice, VoiceClonePrompt
@@ -71,6 +72,34 @@ async def lifespan(app: FastAPI):
         perf_counter() - default_voice_start,
     )
 
+    from speaker.asr import ParakeetASR
+
+    logger.info("Loading speaker ASR model %s", settings.speaker_asr_model)
+    speaker_asr_start = perf_counter()
+    speaker_asr = await asyncio.to_thread(
+        ParakeetASR.from_pretrained,
+        settings.speaker_asr_model,
+    )
+    app.state.speaker_asr = speaker_asr
+    app.state.speaker_asr_lock = asyncio.Lock()
+    warmup_audio, warmup_sample_rate = await asyncio.to_thread(
+        sf.read,
+        DEFAULT_VOICE_REFERENCE_PATH,
+        dtype="float32",
+        always_2d=True,
+    )
+    warmup_transcript = await asyncio.to_thread(
+        speaker_asr.transcribe_waveform,
+        warmup_audio,
+        warmup_sample_rate,
+    )
+    if not warmup_transcript:
+        logger.warning("Speaker ASR warmup completed with an empty transcript.")
+    logger.info(
+        "Speaker ASR is online; load and warmup took %.3fs",
+        perf_counter() - speaker_asr_start,
+    )
+
     try:
         yield
     finally:
@@ -87,6 +116,9 @@ async def lifespan(app: FastAPI):
             await asyncio.gather(*prompt_tasks, return_exceptions=True)
         app.state.voice_clone_prompts.clear()
         app.state.voice_clone_prompt_tasks.clear()
+        app.state.speaker_asr.close()
+        del app.state.speaker_asr
+        del app.state.speaker_asr_lock
         del app.state.default_voice_clone_prompt
         del app.state.tts_model
         del model
@@ -1827,3 +1859,147 @@ async def stream_pseudo_stream_audio(request_id: str) -> StreamingResponse:
             )
 
     return StreamingResponse(audio_chunks(), media_type="audio/pcm")
+
+
+@dataclass
+class SpeakerApplicationContext:
+    generation: Any
+    tts_request: StreamTTSRequest
+    voice_clone_prompt: VoiceClonePrompt | None
+
+
+async def _configure_speaker_session(event: Any) -> Any:
+    from speaker import SpeakerConfiguredContext
+
+    await _validate_conversation_model(event.generation.model)
+    system_prompt = await _resolve_persona_system_prompt(
+        event.persona_id,
+        event.persona_name,
+        event.instruction_prompt,
+    )
+    history = [
+        {"role": "system", "content": system_prompt},
+        *[
+            {"role": message.role, "content": message.content}
+            for message in event.history
+            if message.role != "system"
+        ],
+    ]
+
+    voice_clone_prompt = None
+    if event.generation.clone_voice and event.generation.ref_audio:
+        voice_clone_prompt = await _get_or_create_voice_clone_prompt(
+            event.generation.ref_audio
+        )
+    elif event.generation.clone_voice:
+        voice_clone_prompt = app.state.default_voice_clone_prompt
+
+    tts_request = StreamTTSRequest(
+        messages=[],
+        model=event.generation.model,
+        temperature=event.generation.temperature,
+        repeat_penalty=event.generation.repeat_penalty,
+        seed=event.generation.seed,
+        max_tokens=event.generation.max_tokens,
+        response_format="pcm",
+        clone_voice=event.generation.clone_voice,
+        ref_audio=event.generation.ref_audio,
+        num_step=event.generation.num_step,
+        speed=event.generation.speed,
+    )
+    return SpeakerConfiguredContext(
+        application=SpeakerApplicationContext(
+            generation=event.generation,
+            tts_request=tts_request,
+            voice_clone_prompt=voice_clone_prompt,
+        ),
+        history=history,
+    )
+
+
+async def _transcribe_speaker_audio(audio: bytes) -> str:
+    inference_task: asyncio.Task[str] | None = None
+    async with app.state.speaker_asr_lock:
+        inference_task = asyncio.create_task(
+            asyncio.to_thread(app.state.speaker_asr.transcribe_pcm16, audio)
+        )
+        try:
+            return await asyncio.shield(inference_task)
+        except asyncio.CancelledError:
+            await inference_task
+            raise
+
+
+async def _stream_speaker_text(
+    context: SpeakerApplicationContext,
+    history: list[dict[str, str]],
+) -> AsyncIterator[str]:
+    generation = context.generation
+    request = TextGenerationRequest(
+        messages=[ChatMessage(**message) for message in history],
+        model=generation.model,
+        temperature=generation.temperature,
+        repeat_penalty=generation.repeat_penalty,
+        seed=generation.seed,
+        max_tokens=generation.max_tokens,
+    )
+    payload = _build_ollama_chat_payload(request)
+    payload["stream"] = True
+    async with httpx.AsyncClient(timeout=60) as client:
+        async with client.stream(
+            "POST",
+            f"{OLLAMA_BASE_URL}/api/chat",
+            json=payload,
+        ) as response:
+            response.raise_for_status()
+            async for line in response.aiter_lines():
+                if not line:
+                    continue
+                try:
+                    response_part = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(
+                        "Ollama returned an invalid streaming response."
+                    ) from exc
+                message = response_part.get("message")
+                content = message.get("content") if isinstance(message, dict) else None
+                if isinstance(content, str) and content:
+                    yield content
+
+
+async def _synthesize_speaker_sentence(
+    context: SpeakerApplicationContext,
+    sentence: str,
+) -> bytes:
+    return await _generate_pseudo_stream_audio(
+        sentence,
+        context.tts_request,
+        context.voice_clone_prompt,
+    )
+
+
+@app.websocket("/speaker/v1")
+async def speaker_websocket(websocket: WebSocket) -> None:
+    from speaker import SpeakerServices, SpeakerSession
+
+    offered_protocols = {
+        protocol.strip()
+        for protocol in websocket.headers.get("sec-websocket-protocol", "").split(",")
+        if protocol.strip()
+    }
+    if "p-gpt-speaker.v1" not in offered_protocols:
+        await websocket.close(code=1002)
+        return
+
+    await websocket.accept(subprotocol="p-gpt-speaker.v1")
+    session = SpeakerSession(
+        websocket,
+        SpeakerServices(
+            configure=_configure_speaker_session,
+            transcribe=_transcribe_speaker_audio,
+            stream_text=_stream_speaker_text,
+            synthesize=_synthesize_speaker_sentence,
+        ),
+        logger,
+    )
+    await session.run()
