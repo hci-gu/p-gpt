@@ -1,3 +1,5 @@
+from contextlib import contextmanager, nullcontext
+import logging
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any
@@ -9,6 +11,25 @@ QWEN_SYSTEM_PROMPT = (
     "You are Qwen, a virtual human capable of perceiving auditory inputs "
     "and generating concise, natural text and speech responses."
 )
+
+
+@contextmanager
+def _qwen2_5_config_load_logging():
+    """Hide a known Transformers false positive for Qwen2.5-Omni.
+
+    Qwen2.5-Omni's Talker config deliberately uses a small codec vocabulary
+    while its ``tts_text_*`` IDs belong to the shared text vocabulary. Recent
+    Transformers releases validate every ``*_token_id`` against the Talker
+    vocabulary and log a warning, even though these IDs are valid for the
+    model's split-vocabulary architecture.
+    """
+    config_logger = logging.getLogger("transformers.configuration_utils")
+    previous_level = config_logger.level
+    config_logger.setLevel(logging.ERROR)
+    try:
+        yield
+    finally:
+        config_logger.setLevel(previous_level)
 
 
 class QwenOmniModel:
@@ -50,8 +71,14 @@ class QwenOmniModel:
             model_kwargs["dtype"] = model_kwargs.pop("torch_dtype")
             model_kwargs["attn_implementation"] = "flash_attention_2"
 
-        self.model = model_type.from_pretrained(model_id, **model_kwargs)
-        self.processor = processor_type.from_pretrained(model_id)
+        load_context = (
+            _qwen2_5_config_load_logging()
+            if not self.is_qwen3
+            else nullcontext()
+        )
+        with load_context:
+            self.model = model_type.from_pretrained(model_id, **model_kwargs)
+            self.processor = processor_type.from_pretrained(model_id)
         self.torch = torch
 
     def generate(
