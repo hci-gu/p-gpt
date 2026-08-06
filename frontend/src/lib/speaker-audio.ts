@@ -18,6 +18,24 @@ export const float32ToPcm16 = (audio: Float32Array) => {
 
 export type SpeakerAudioEvent =
   | {
+      activity:
+        | 'audio_context'
+        | 'capture_started'
+        | 'capture_stalled'
+        | 'capture_stopped'
+        | 'inference_timeout'
+        | 'microphone_ended'
+        | 'probability_summary'
+        | 'worker_error'
+        | 'worker_ready'
+      detail?: string
+      probabilityAverage?: number
+      probabilityMax?: number
+      probabilityMin?: number
+      sampleCount?: number
+      type: 'vad-diagnostic'
+    }
+  | {
       type: 'speech-candidate'
     }
   | {

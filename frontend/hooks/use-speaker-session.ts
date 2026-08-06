@@ -36,6 +36,7 @@ export const useSpeakerSession = ({
   const generationParameters = usePreferencesStore(
     (state) => state.generationParameters
   )
+  const activeChatKey = useChatStore((state) => state.activeChatKey)
   const commitUser = useChatStore(
     (state) => state.commitSpeakerUserMessage
   )
@@ -63,6 +64,7 @@ export const useSpeakerSession = ({
   const pendingInterruptedGenerationRef = useRef<number | null>(null)
   const playedTextRef = useRef(new Map<number, string[]>())
   const committedGenerationsRef = useRef(new Set<number>())
+  const sessionChatKeyRef = useRef(activeChatKey)
   const sendEventRef = useRef<(type: string, values?: Record<string, unknown>) => void>(
     () => undefined
   )
@@ -106,6 +108,15 @@ export const useSpeakerSession = ({
     if (generation === null || committedGenerationsRef.current.has(generation)) {
       return
     }
+    if (
+      useChatStore.getState().activeChatKey !== sessionChatKeyRef.current
+    ) {
+      console.debug(
+        '[speaker-session] skipped interrupted commit after conversation switch',
+        { generation }
+      )
+      return
+    }
     const text = (playedTextRef.current.get(generation) ?? []).join(' ').trim()
     if (!text) {
       return
@@ -114,6 +125,12 @@ export const useSpeakerSession = ({
     setLatestAssistantTranscript(text)
     commitAssistantRef.current(text, 'interrupted')
   }, [])
+
+  useEffect(() => {
+    setLatestUserTranscript(null)
+    setLatestAssistantTranscript(null)
+    setError(null)
+  }, [activeChatKey])
 
   useEffect(() => {
     if (!enabled) {
@@ -138,6 +155,10 @@ export const useSpeakerSession = ({
     let fatal = false
     let reconnectAttempts = 0
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null
+    sessionChatKeyRef.current = activeChatKey
+
+    const isCurrentConversation = () =>
+      useChatStore.getState().activeChatKey === activeChatKey
 
     const sendEvent = (type: string, values: Record<string, unknown> = {}) => {
       const socket = socketRef.current
@@ -162,6 +183,20 @@ export const useSpeakerSession = ({
     }
 
     const handleServerEvent = (serverEvent: SpeakerServerEvent) => {
+      if (!isCurrentConversation()) {
+        console.debug(
+          '[speaker-session] dropped event for the previous conversation',
+          serverEvent.type
+        )
+        return
+      }
+      console.debug('[speaker-session] server event', {
+        generation: serverEvent.responseGeneration,
+        revision: serverEvent.turnRevision,
+        segmentId: serverEvent.segmentId,
+        turnId: serverEvent.turnId,
+        type: serverEvent.type,
+      })
       switch (serverEvent.type) {
         case 'session.ready':
           reconnectAttempts = 0
@@ -209,7 +244,8 @@ export const useSpeakerSession = ({
         case 'response.audio.segment_done':
           if (
             typeof serverEvent.responseGeneration === 'number' &&
-            serverEvent.segmentId
+            serverEvent.segmentId &&
+            serverEvent.responseGeneration === binaryGenerationRef.current
           ) {
             playerRef.current?.endSegment(
               serverEvent.responseGeneration,
@@ -219,27 +255,42 @@ export const useSpeakerSession = ({
           }
           return
         case 'response.audio.done':
-          if (typeof serverEvent.responseGeneration === 'number') {
+          if (
+            typeof serverEvent.responseGeneration === 'number' &&
+            serverEvent.responseGeneration === generationRef.current
+          ) {
             playerRef.current?.endResponse(serverEvent.responseGeneration)
           }
           return
         case 'response.completed':
           if (
-            typeof serverEvent.responseGeneration === 'number' &&
-            typeof serverEvent.text === 'string'
+            typeof serverEvent.responseGeneration !== 'number' ||
+            serverEvent.responseGeneration !== generationRef.current
           ) {
-            finalizeServerResponse(
-              serverEvent.responseGeneration,
-              serverEvent.text,
-              false
-            )
+            return
+          }
+          if (typeof serverEvent.text === 'string') {
+            finalizeServerResponse(serverEvent.responseGeneration, serverEvent.text, false)
           }
           phaseRef.current = 'idle'
           generationRef.current = null
           setStatus('listening')
           return
         case 'response.cancelled':
-          playerRef.current?.clear()
+          if (typeof serverEvent.responseGeneration !== 'number') {
+            return
+          }
+          const cancelledCurrent =
+            serverEvent.responseGeneration === generationRef.current
+          const cancelledPending =
+            serverEvent.responseGeneration ===
+            pendingInterruptedGenerationRef.current
+          if (!cancelledCurrent && !cancelledPending) {
+            return
+          }
+          if (cancelledCurrent) {
+            playerRef.current?.clear()
+          }
           if (
             typeof serverEvent.responseGeneration === 'number' &&
             typeof serverEvent.text === 'string'
@@ -256,8 +307,9 @@ export const useSpeakerSession = ({
           ) {
             pendingInterruptedGenerationRef.current = null
           }
-          if (phaseRef.current !== 'capturing') {
+          if (cancelledCurrent && phaseRef.current !== 'capturing') {
             phaseRef.current = 'idle'
+            generationRef.current = null
             setStatus('listening')
           }
           return
@@ -278,6 +330,11 @@ export const useSpeakerSession = ({
       if (disposed || fatal) {
         return
       }
+      playedTextRef.current.clear()
+      committedGenerationsRef.current.clear()
+      pendingInterruptedGenerationRef.current = null
+      generationRef.current = null
+      binaryGenerationRef.current = null
       setStatus(reconnectAttempts ? 'reconnecting' : 'connecting')
       const socket = new WebSocket(
         getSpeakerSocketUrl(apiEndpoint),
@@ -287,6 +344,7 @@ export const useSpeakerSession = ({
       socketRef.current = socket
 
       socket.addEventListener('open', () => {
+        console.debug('[speaker-session] socket opened', { activeChatKey })
         const history = useChatStore.getState().getConversationHistory()
         socket.send(
           JSON.stringify(
@@ -351,10 +409,15 @@ export const useSpeakerSession = ({
       })
 
       socket.addEventListener('error', () => {
+        console.debug('[speaker-session] socket error', { activeChatKey })
         setError('The speaker connection failed.')
       })
 
       socket.addEventListener('close', () => {
+        console.debug('[speaker-session] socket closed', {
+          activeChatKey,
+          phase: phaseRef.current,
+        })
         if (socketRef.current === socket) {
           socketRef.current = null
         }
@@ -395,6 +458,7 @@ export const useSpeakerSession = ({
       setIsReady(false)
     }
   }, [
+    activeChatKey,
     commitAssistant,
     commitInterruptedLocally,
     commitUser,
@@ -407,7 +471,25 @@ export const useSpeakerSession = ({
     const sendEvent = sendEventRef.current
     const socket = socketRef.current
 
+    if (audioEvent.type === 'vad-diagnostic') {
+      sendEvent('client.vad_diagnostic', {
+        activity: audioEvent.activity,
+        detail: audioEvent.detail,
+        phase: phaseRef.current,
+        probabilityAverage: audioEvent.probabilityAverage,
+        probabilityMax: audioEvent.probabilityMax,
+        probabilityMin: audioEvent.probabilityMin,
+        sampleCount: audioEvent.sampleCount,
+      })
+      return
+    }
+
     if (audioEvent.type === 'speech-candidate') {
+      console.debug('[speaker-session] VAD candidate', {
+        phase: phaseRef.current,
+        revision: turnRevisionRef.current,
+        turnId: turnIdRef.current,
+      })
       if (phaseRef.current === 'grace' && turnIdRef.current) {
         sendEvent('input.speech_candidate', {
           turnId: turnIdRef.current,
@@ -417,6 +499,11 @@ export const useSpeakerSession = ({
       return
     }
     if (audioEvent.type === 'speech-candidate-cancelled') {
+      console.debug('[speaker-session] VAD candidate cancelled', {
+        phase: phaseRef.current,
+        revision: turnRevisionRef.current,
+        turnId: turnIdRef.current,
+      })
       if (phaseRef.current === 'grace' && turnIdRef.current) {
         sendEvent('input.speech_candidate_cancelled', {
           turnId: turnIdRef.current,
@@ -442,6 +529,11 @@ export const useSpeakerSession = ({
         turnRevisionRef.current = 0
       }
       phaseRef.current = 'capturing'
+      console.debug('[speaker-session] VAD speech start', {
+        reopened,
+        revision: turnRevisionRef.current,
+        turnId: turnIdRef.current,
+      })
       setStatus('hearing')
       sendEvent('input.speech_started', {
         turnId: turnIdRef.current,
@@ -456,6 +548,10 @@ export const useSpeakerSession = ({
         !socket ||
         socket.readyState !== WebSocket.OPEN
       ) {
+        console.debug('[speaker-session] dropped microphone frame', {
+          phase: phaseRef.current,
+          socketState: socket?.readyState,
+        })
         return
       }
       if (socket.bufferedAmount > maximumBufferedBytes) {
@@ -482,17 +578,27 @@ export const useSpeakerSession = ({
         }
       )
       phaseRef.current = 'grace'
+      console.debug('[speaker-session] VAD soft end', {
+        inputLimit: audioEvent.type === 'input-limit',
+        revision: turnRevisionRef.current,
+        turnId: turnIdRef.current,
+      })
       setStatus('thinking')
     }
   }, [])
 
   return {
     audioLevel,
-    canCapture: enabled && isReady,
+    canCapture:
+      enabled && isReady && sessionChatKeyRef.current === activeChatKey,
     error,
     isPlaying,
-    latestAssistantTranscript,
-    latestUserTranscript,
+    latestAssistantTranscript:
+      sessionChatKeyRef.current === activeChatKey
+        ? latestAssistantTranscript
+        : null,
+    latestUserTranscript:
+      sessionChatKeyRef.current === activeChatKey ? latestUserTranscript : null,
     onAudioEvent,
     status,
   }

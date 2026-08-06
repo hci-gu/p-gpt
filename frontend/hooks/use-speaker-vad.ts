@@ -80,22 +80,62 @@ export const useSpeakerVad = ({
   const [isMuted, setIsMuted] = useState(true)
   const [isVoiceActive, setIsVoiceActive] = useState(false)
   const [status, setStatus] = useState<SpeakerVadStatus>('idle')
+  const [restartToken, setRestartToken] = useState(0)
   const audioContextRef = useRef<AudioContext | null>(null)
   const audioBufferRef = useRef(new Float32Array())
   const isRunningRef = useRef(false)
+  const lastCaptureCallbackAtRef = useRef(0)
   const onAudioEventRef = useRef(onAudioEvent)
   const processorRef = useRef<ScriptProcessorNode | null>(null)
   const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null)
   const streamRef = useRef<MediaStream | null>(null)
   const workerRef = useRef<Worker | null>(null)
   const wasEnabledRef = useRef(false)
+  const probabilityWindowRef = useRef({
+    count: 0,
+    maximum: 0,
+    minimum: 1,
+    startedAt: 0,
+    total: 0,
+  })
+  const restartPendingRef = useRef(false)
 
   onAudioEventRef.current = onAudioEvent
 
+  const emitDiagnostic = useCallback(
+    (
+      diagnostic: Omit<
+        Extract<SpeakerAudioEvent, { type: 'vad-diagnostic' }>,
+        'type'
+      >
+    ) => {
+      const event = { ...diagnostic, type: 'vad-diagnostic' } as const
+      console.debug('[speaker-vad]', event)
+      onAudioEventRef.current(event)
+    },
+    []
+  )
+
+  const resetProbabilityWindow = useCallback(() => {
+    probabilityWindowRef.current = {
+      count: 0,
+      maximum: 0,
+      minimum: 1,
+      startedAt: performance.now(),
+      total: 0,
+    }
+  }, [])
+
   const cleanupAudio = useCallback(async () => {
+    const wasRunning = isRunningRef.current
     isRunningRef.current = false
     audioBufferRef.current = new Float32Array()
     setIsVoiceActive(false)
+
+    if (wasRunning) {
+      emitDiagnostic({ activity: 'capture_stopped' })
+    }
+    resetProbabilityWindow()
 
     if (processorRef.current) {
       processorRef.current.disconnect()
@@ -108,18 +148,20 @@ export const useSpeakerVad = ({
 
     if (streamRef.current) {
       for (const track of streamRef.current.getTracks()) {
+        track.onended = null
         track.stop()
       }
       streamRef.current = null
     }
 
     if (audioContextRef.current) {
+      audioContextRef.current.onstatechange = null
       await audioContextRef.current.close()
       audioContextRef.current = null
     }
 
     workerRef.current?.postMessage({ type: 'reset' })
-  }, [])
+  }, [emitDiagnostic, resetProbabilityWindow])
 
   const disposeWorker = useCallback(() => {
     workerRef.current?.terminate()
@@ -141,23 +183,57 @@ export const useSpeakerVad = ({
 
       if (message.type === 'ready') {
         setStatus('monitoring')
+        emitDiagnostic({ activity: 'worker_ready' })
         return
       }
 
       if (message.type === 'error') {
+        emitDiagnostic({
+          activity: message.error.includes('timed out')
+            ? 'inference_timeout'
+            : 'worker_error',
+          detail: message.error.slice(0, 256),
+        })
         setError(message.error)
         setStatus('error')
         setIsMuted(true)
+        worker.terminate()
+        if (workerRef.current === worker) {
+          workerRef.current = null
+        }
         void cleanupAudio()
         return
       }
 
       if (message.type === 'activity-change') {
+        console.debug('[speaker-vad] activity-change', message.active)
         setIsVoiceActive(message.active)
         return
       }
 
       if (message.type === 'speech-probability') {
+        if (!Number.isFinite(message.probability)) {
+          return
+        }
+        const probability = Math.min(1, Math.max(0, message.probability))
+        const window = probabilityWindowRef.current
+        if (window.count === 0) {
+          window.startedAt = performance.now()
+        }
+        window.count += 1
+        window.total += probability
+        window.minimum = Math.min(window.minimum, probability)
+        window.maximum = Math.max(window.maximum, probability)
+        if (performance.now() - window.startedAt >= 1_000) {
+          emitDiagnostic({
+            activity: 'probability_summary',
+            probabilityAverage: window.total / window.count,
+            probabilityMax: window.maximum,
+            probabilityMin: window.minimum,
+            sampleCount: window.count,
+          })
+          resetProbabilityWindow()
+        }
         return
       }
 
@@ -174,7 +250,7 @@ export const useSpeakerVad = ({
 
     workerRef.current = worker
     return worker
-  }, [cleanupAudio])
+  }, [cleanupAudio, emitDiagnostic, resetProbabilityWindow])
 
   const startMonitoring = useCallback(async () => {
     if (isRunningRef.current || !enabled || paused) {
@@ -211,6 +287,25 @@ export const useSpeakerVad = ({
       const source = audioContext.createMediaStreamSource(stream)
       const processor = audioContext.createScriptProcessor(4096, 1, 1)
 
+      audioContext.onstatechange = () => {
+        emitDiagnostic({
+          activity: 'audio_context',
+          detail: audioContext.state,
+        })
+      }
+      for (const track of stream.getAudioTracks()) {
+        track.onended = () => {
+          if (!isRunningRef.current) {
+            return
+          }
+          emitDiagnostic({ activity: 'microphone_ended' })
+          setError('The microphone input ended unexpectedly.')
+          setStatus('error')
+          setIsMuted(true)
+          void cleanupAudio()
+        }
+      }
+
       streamRef.current = stream
       audioContextRef.current = audioContext
       sourceRef.current = source
@@ -221,6 +316,7 @@ export const useSpeakerVad = ({
         if (!isRunningRef.current) {
           return
         }
+        lastCaptureCallbackAtRef.current = performance.now()
 
         const sourceAudio = new Float32Array(event.inputBuffer.getChannelData(0))
         const audio = resampleToTargetRate(sourceAudio, audioContext.sampleRate)
@@ -236,6 +332,12 @@ export const useSpeakerVad = ({
       source.connect(processor)
       processor.connect(audioContext.destination)
       await audioContext.resume()
+      lastCaptureCallbackAtRef.current = performance.now()
+      resetProbabilityWindow()
+      emitDiagnostic({
+        activity: 'capture_started',
+        detail: `source_rate=${audioContext.sampleRate};target_rate=${speakerAudioSampleRate}`,
+      })
     } catch (caughtError) {
       await cleanupAudio()
       setError(
@@ -246,7 +348,14 @@ export const useSpeakerVad = ({
       setStatus('error')
       setIsMuted(true)
     }
-  }, [cleanupAudio, enabled, getWorker, paused])
+  }, [
+    cleanupAudio,
+    emitDiagnostic,
+    enabled,
+    getWorker,
+    paused,
+    resetProbabilityWindow,
+  ])
 
   const mute = useCallback(() => {
     setIsMuted(true)
@@ -278,7 +387,41 @@ export const useSpeakerVad = ({
     }
 
     void startMonitoring()
-  }, [cleanupAudio, disposeWorker, enabled, isMuted, paused, startMonitoring])
+  }, [
+    cleanupAudio,
+    disposeWorker,
+    enabled,
+    isMuted,
+    paused,
+    restartToken,
+    startMonitoring,
+  ])
+
+  useEffect(() => {
+    if (!enabled || isMuted || paused) {
+      return
+    }
+    const watchdog = window.setInterval(() => {
+      const stalledFor = performance.now() - lastCaptureCallbackAtRef.current
+      if (
+        !isRunningRef.current ||
+        restartPendingRef.current ||
+        stalledFor < 5_000
+      ) {
+        return
+      }
+      restartPendingRef.current = true
+      emitDiagnostic({
+        activity: 'capture_stalled',
+        detail: `no_audio_callback_ms=${Math.round(stalledFor)}`,
+      })
+      void cleanupAudio().finally(() => {
+        restartPendingRef.current = false
+        setRestartToken((current) => current + 1)
+      })
+    }, 1_000)
+    return () => window.clearInterval(watchdog)
+  }, [cleanupAudio, emitDiagnostic, enabled, isMuted, paused])
 
   useEffect(
     () => () => {

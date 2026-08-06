@@ -3,6 +3,7 @@ import {
   CHAT_HISTORY_UPDATED_EVENT,
   deleteChatHistory,
   listChatHistories,
+  renameChatHistory,
 } from '@/lib/chat-history'
 import { useChatStore } from '@/src/state/chat'
 import { useAuthStore } from '@/src/state/auth'
@@ -29,7 +30,6 @@ import {
   SidebarGroupLabel,
   SidebarHeader,
   SidebarMenu,
-  SidebarMenuAction,
   SidebarMenuButton,
   SidebarMenuItem,
   SidebarMenuSkeleton,
@@ -46,12 +46,13 @@ import {
   MessageSquareIcon,
   PanelLeftCloseIcon,
   PanelLeftOpenIcon,
+  PencilIcon,
   PlusIcon,
   Settings2Icon,
   Trash2Icon,
   UsersIcon,
 } from 'lucide-react'
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { ComponentProps } from 'react'
 
 const getChatTimestamp = (record: ChatHistoryRecord) => {
@@ -90,6 +91,11 @@ export function AppSidebar(props: ComponentProps<typeof Sidebar>) {
   const [loadError, setLoadError] = useState(false)
   const [deletingRecordId, setDeletingRecordId] = useState<string | null>(null)
   const [deleteErrorId, setDeleteErrorId] = useState<string | null>(null)
+  const [editingRecordId, setEditingRecordId] = useState<string | null>(null)
+  const [renameDraft, setRenameDraft] = useState('')
+  const [renamingRecordId, setRenamingRecordId] = useState<string | null>(null)
+  const [renameErrorId, setRenameErrorId] = useState<string | null>(null)
+  const [isHistoryExpanded, setIsHistoryExpanded] = useState(false)
   const [isSettingsOpen, setIsSettingsOpen] = useState(false)
   const [isBackgroundDialogOpen, setIsBackgroundDialogOpen] = useState(false)
   const [isPersonaDialogOpen, setIsPersonaDialogOpen] = useState(false)
@@ -98,13 +104,11 @@ export function AppSidebar(props: ComponentProps<typeof Sidebar>) {
   const loadChatHistories = useCallback(async (signal?: AbortSignal) => {
     try {
       const records = await listChatHistories(signal)
-      const latestRecords = records
-        .sort(
-          (first, second) =>
-            new Date(second.updated).getTime() -
-            new Date(first.updated).getTime()
-        )
-        .slice(0, 5)
+      const latestRecords = records.sort(
+        (first, second) =>
+          new Date(second.updated).getTime() -
+          new Date(first.updated).getTime()
+      )
 
       setChatHistories(latestRecords)
       setLoadError(false)
@@ -130,6 +134,9 @@ export function AppSidebar(props: ComponentProps<typeof Sidebar>) {
         setChatHistories((records) =>
           records.filter((record) => record.id !== recordId)
         )
+        setEditingRecordId((current) =>
+          current === recordId ? null : current
+        )
 
         clearDeletedChat(recordId)
       } catch {
@@ -139,6 +146,50 @@ export function AppSidebar(props: ComponentProps<typeof Sidebar>) {
       }
     },
     [clearDeletedChat]
+  )
+
+  const handleStartRename = useCallback((record: ChatHistoryRecord) => {
+    setEditingRecordId(record.id)
+    setRenameDraft(record.title)
+    setRenameErrorId(null)
+  }, [])
+
+  const handleRenameChat = useCallback(
+    async (record: ChatHistoryRecord) => {
+      const title = renameDraft.trim()
+      if (!title) {
+        setRenameErrorId(record.id)
+        return
+      }
+      if (title === record.title) {
+        setEditingRecordId(null)
+        setRenameErrorId(null)
+        return
+      }
+
+      setRenamingRecordId(record.id)
+      setRenameErrorId(null)
+      try {
+        await renameChatHistory(record.id, title)
+        setChatHistories((records) =>
+          records.map((current) =>
+            current.id === record.id ? { ...current, title } : current
+          )
+        )
+        setEditingRecordId(null)
+      } catch {
+        setRenameErrorId(record.id)
+      } finally {
+        setRenamingRecordId(null)
+      }
+    },
+    [renameDraft]
+  )
+
+  const visibleChatHistories = useMemo(
+    () =>
+      isHistoryExpanded ? chatHistories : chatHistories.slice(0, 5),
+    [chatHistories, isHistoryExpanded]
   )
 
   useEffect(() => {
@@ -194,7 +245,14 @@ export function AppSidebar(props: ComponentProps<typeof Sidebar>) {
         <SidebarGroup>
           <SidebarGroupLabel>Recent chats</SidebarGroupLabel>
           <SidebarGroupContent>
-            <SidebarMenu>
+            <div
+              className={
+                isHistoryExpanded && chatHistories.length > 5
+                  ? 'max-h-[50vh] overflow-y-auto overscroll-contain pr-1'
+                  : undefined
+              }
+            >
+              <SidebarMenu>
               {isLoading &&
                 Array.from({ length: 3 }, (_, index) => (
                   <SidebarMenuItem key={index}>
@@ -219,57 +277,140 @@ export function AppSidebar(props: ComponentProps<typeof Sidebar>) {
               )}
               {!isLoading &&
                 !loadError &&
-                chatHistories.map((record) => {
+                visibleChatHistories.map((record) => {
+                  const isEditing = editingRecordId === record.id
                   return (
                     <SidebarMenuItem key={record.id}>
-                      <SidebarMenuButton
-                        aria-current={
-                          activeHistoryId === record.id ? 'page' : undefined
-                        }
-                        className="h-auto min-h-10 items-start"
-                        isActive={activeHistoryId === record.id}
-                        onClick={() =>
-                          loadChat(
-                            record.id,
-                            record.conversation,
-                            record.personaId
-                          )
-                        }
-                        tooltip={record.title}
-                      >
-                        <MessageSquareIcon className="mt-0.5" />
-                        <span className="grid min-w-0 flex-1 leading-tight">
-                          <span className="truncate">{record.title}</span>
-                          <span className="mt-0.5 text-[10px] text-sidebar-foreground/55">
-                            {getChatTimestamp(record)}
+                      {isEditing ? (
+                        <form
+                          className={`flex min-h-10 w-full items-center gap-2 rounded-[calc(var(--radius-sm)+2px)] p-2 pr-14 text-xs ${
+                            activeHistoryId === record.id
+                              ? 'bg-sidebar-accent'
+                              : ''
+                          }`}
+                          onSubmit={(event) => {
+                            event.preventDefault()
+                            void handleRenameChat(record)
+                          }}
+                        >
+                          <MessageSquareIcon className="size-4 shrink-0" />
+                          <input
+                            aria-label={`Rename ${record.title}`}
+                            autoFocus
+                            className={`h-7 min-w-0 flex-1 rounded border bg-background px-2 text-xs outline-none focus:ring-2 focus:ring-sidebar-ring ${
+                              renameErrorId === record.id
+                                ? 'border-destructive'
+                                : 'border-sidebar-border'
+                            }`}
+                            disabled={renamingRecordId === record.id}
+                            maxLength={120}
+                            onBlur={() => {
+                              if (renamingRecordId !== record.id) {
+                                setEditingRecordId(null)
+                                setRenameErrorId(null)
+                              }
+                            }}
+                            onChange={(event) => setRenameDraft(event.target.value)}
+                            onFocus={(event) => event.currentTarget.select()}
+                            onKeyDown={(event) => {
+                              if (event.key === 'Escape') {
+                                setEditingRecordId(null)
+                                setRenameErrorId(null)
+                              }
+                            }}
+                            title={
+                              renameErrorId === record.id
+                                ? 'Could not rename chat. Use a non-empty title and try again.'
+                                : 'Press Enter to save'
+                            }
+                            value={renameDraft}
+                          />
+                        </form>
+                      ) : (
+                        <SidebarMenuButton
+                          aria-current={
+                            activeHistoryId === record.id ? 'page' : undefined
+                          }
+                          className="h-auto min-h-10 items-start pr-14"
+                          isActive={activeHistoryId === record.id}
+                          onClick={() =>
+                            loadChat(
+                              record.id,
+                              record.conversation,
+                              record.personaId
+                            )
+                          }
+                          tooltip={record.title}
+                        >
+                          <MessageSquareIcon className="mt-0.5" />
+                          <span className="grid min-w-0 flex-1 leading-tight">
+                            <span className="truncate">{record.title}</span>
+                            <span className="mt-0.5 text-[10px] text-sidebar-foreground/55">
+                              {getChatTimestamp(record)}
+                            </span>
                           </span>
-                        </span>
-                      </SidebarMenuButton>
-                      <SidebarMenuAction
-                        aria-label={`Delete ${record.title}`}
-                        className={`top-2.5 hover:bg-destructive/15 hover:text-destructive focus-visible:text-destructive ${
-                          deleteErrorId === record.id
-                            ? 'bg-destructive/15 text-destructive'
-                            : ''
+                        </SidebarMenuButton>
+                      )}
+                      <div
+                        className={`absolute inset-y-0 right-1 flex items-center gap-0.5 transition-opacity group-data-[collapsible=icon]:hidden ${
+                          isEditing
+                            ? 'opacity-100'
+                            : 'group-focus-within/menu-item:opacity-100 group-hover/menu-item:opacity-100 md:opacity-0'
                         }`}
-                        disabled={deletingRecordId === record.id}
-                        onClick={(event) => {
-                          event.stopPropagation()
-                          void handleDeleteChat(record.id)
-                        }}
-                        showOnHover
-                        title={
-                          deleteErrorId === record.id
-                            ? 'Could not delete chat. Try again.'
-                            : 'Delete chat'
-                        }
                       >
-                        <Trash2Icon />
-                      </SidebarMenuAction>
+                        <button
+                          aria-label={`Rename ${record.title}`}
+                          className={`flex size-5 items-center justify-center rounded-[calc(var(--radius-sm)-2px)] outline-none hover:bg-sidebar-accent focus-visible:ring-2 focus-visible:ring-sidebar-ring [&>svg]:size-4 ${
+                            renameErrorId === record.id
+                              ? 'text-destructive'
+                              : 'text-sidebar-foreground'
+                          }`}
+                          disabled={renamingRecordId === record.id}
+                          onClick={(event) => {
+                            event.stopPropagation()
+                            handleStartRename(record)
+                          }}
+                          title="Rename chat"
+                          type="button"
+                        >
+                          <PencilIcon />
+                        </button>
+                        <button
+                          aria-label={`Delete ${record.title}`}
+                          className={`flex size-5 items-center justify-center rounded-[calc(var(--radius-sm)-2px)] outline-none hover:bg-destructive/15 hover:text-destructive focus-visible:ring-2 focus-visible:ring-sidebar-ring focus-visible:text-destructive [&>svg]:size-4 ${
+                            deleteErrorId === record.id
+                              ? 'bg-destructive/15 text-destructive'
+                              : 'text-sidebar-foreground'
+                          }`}
+                          disabled={deletingRecordId === record.id}
+                          onClick={(event) => {
+                            event.stopPropagation()
+                            void handleDeleteChat(record.id)
+                          }}
+                          title={
+                            deleteErrorId === record.id
+                              ? 'Could not delete chat. Try again.'
+                              : 'Delete chat'
+                          }
+                          type="button"
+                        >
+                          <Trash2Icon />
+                        </button>
+                      </div>
                     </SidebarMenuItem>
                   )
                 })}
-            </SidebarMenu>
+              </SidebarMenu>
+            </div>
+            {!isLoading && !loadError && chatHistories.length > 5 && (
+              <button
+                className="mt-1 px-2 text-left text-xs text-sidebar-foreground/65 hover:text-sidebar-foreground hover:underline group-data-[collapsible=icon]:hidden"
+                onClick={() => setIsHistoryExpanded((expanded) => !expanded)}
+                type="button"
+              >
+                {isHistoryExpanded ? 'Show less' : 'Load more'}
+              </button>
+            )}
           </SidebarGroupContent>
         </SidebarGroup>
       </SidebarContent>

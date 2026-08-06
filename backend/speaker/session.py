@@ -22,13 +22,14 @@ from .protocol import (
     SpeechCandidateEvent,
     SpeechSoftEndedEvent,
     SpeechStartedEvent,
+    VadDiagnosticEvent,
     parse_client_event,
 )
 
 INPUT_FRAME_BYTES = 1_024
 MAX_UTTERANCE_BYTES = 60 * 16_000 * 2
 OUTPUT_CHUNK_BYTES = 24_000 * 2 // 10
-REOPEN_GRACE_SECONDS = 1.0
+REOPEN_GRACE_SECONDS = 1.5
 
 
 @dataclass
@@ -77,17 +78,26 @@ class SentenceSegmenter:
         start = 0
         index = 0
         while index < len(self.buffer):
-            if self.buffer[index] not in ".!?":
+            if self.buffer[index] not in ".!?…":
                 index += 1
                 continue
             end = index + 1
-            while end < len(self.buffer) and self.buffer[end] in '.!?"\')]':
+            while end < len(self.buffer) and self.buffer[end] in '.!?…"\')]':
                 end += 1
+            # LLM token boundaries can split an ellipsis. Keep trailing
+            # punctuation buffered until the next token proves the boundary.
+            if end == len(self.buffer):
+                break
             if end < len(self.buffer) and not self.buffer[end].isspace():
                 index = end
                 continue
             candidate = self.buffer[start:end].strip()
             if self.buffer[index] == "." and self._is_abbreviation(candidate):
+                index = end
+                continue
+            # Never enqueue punctuation by itself. Retaining it in the buffer
+            # attaches a standalone ellipsis to the following spoken phrase.
+            if candidate and not any(character.isalnum() for character in candidate):
                 index = end
                 continue
             if candidate:
@@ -107,7 +117,7 @@ class SentenceSegmenter:
     def finish(self) -> list[str]:
         remaining = self.buffer.strip()
         self.buffer = ""
-        return [remaining] if remaining else []
+        return [remaining] if remaining and any(character.isalnum() for character in remaining) else []
 
 
 class SpeakerSession:
@@ -116,10 +126,12 @@ class SpeakerSession:
         websocket: Any,
         services: SpeakerServices,
         logger: logging.Logger,
+        reopen_grace_seconds: float = REOPEN_GRACE_SECONDS,
     ) -> None:
         self.websocket = websocket
         self.services = services
         self.logger = logger
+        self.reopen_grace_seconds = reopen_grace_seconds
         self.session_id = str(uuid4())
         self.state: Literal[
             "awaiting_config", "idle", "capturing", "grace", "responding", "closed"
@@ -141,8 +153,10 @@ class SpeakerSession:
         self.played_segments: set[str] = set()
         self.send_lock = asyncio.Lock()
         self.first_audio_sent = False
+        self.received_audio_frames = 0
 
     async def run(self) -> None:
+        self.logger.debug("Speaker socket opened: session=%s", self.session_id)
         try:
             while True:
                 message = await self.websocket.receive()
@@ -155,6 +169,14 @@ class SpeakerSession:
                 elif raw_text is not None:
                     await self._handle_text(raw_text)
         finally:
+            self.logger.debug(
+                "Speaker socket closed: session=%s state=%s turn=%s revision=%s generation=%s",
+                self.session_id,
+                self.state,
+                self.turn_id,
+                self.turn_revision,
+                self.current_generation,
+            )
             self.state = "closed"
             self._invalidate_pipeline()
 
@@ -166,6 +188,16 @@ class SpeakerSession:
             await self.websocket.close(code=1008)
             self.state = "closed"
             return
+
+        self.logger.debug(
+            "Speaker control received: session=%s state=%s type=%s turn=%s revision=%s generation=%s",
+            self.session_id,
+            self.state,
+            event.type,
+            getattr(event, "turn_id", None),
+            getattr(event, "turn_revision", None),
+            getattr(event, "response_generation", None),
+        )
 
         if isinstance(event, SessionConfigureEvent):
             await self._configure(event)
@@ -185,6 +217,19 @@ class SpeakerSession:
             await self._response_playback_completed(event)
         elif isinstance(event, ResponseCancelEvent):
             await self._cancel_response("client_cancelled")
+        elif isinstance(event, VadDiagnosticEvent):
+            self.logger.debug(
+                "Speaker client VAD: session=%s state=%s client_phase=%s activity=%s detail=%s samples=%s probability_min=%s probability_average=%s probability_max=%s",
+                self.session_id,
+                self.state,
+                event.phase,
+                event.activity,
+                event.detail,
+                event.sample_count,
+                event.probability_min,
+                event.probability_average,
+                event.probability_max,
+            )
 
     async def _configure(self, event: SessionConfigureEvent) -> None:
         if self.state != "awaiting_config":
@@ -212,6 +257,12 @@ class SpeakerSession:
             self.state = "closed"
             return
         self.state = "idle"
+        self.logger.info(
+            "Speaker session ready: session=%s history_messages=%s grace_seconds=%.3f",
+            self.session_id,
+            len(self.context.history),
+            self.reopen_grace_seconds,
+        )
         await self._send_json(
             "session.ready",
             inputAudio={"encoding": "pcm_s16le", "sampleRate": 16_000, "channels": 1, "frameSamples": 512},
@@ -230,22 +281,70 @@ class SpeakerSession:
             await self._start_generation()
             return
         self.audio.extend(audio)
+        self.received_audio_frames += 1
+        if self.received_audio_frames % 32 == 0:
+            self.logger.debug(
+                "Speaker audio capture progress: session=%s turn=%s revision=%s frames=%s audio_seconds=%.3f",
+                self.session_id,
+                self.turn_id,
+                self.turn_revision,
+                self.received_audio_frames,
+                len(self.audio) / (16_000 * 2),
+            )
 
     async def _speech_candidate(self, event: SpeechCandidateEvent) -> None:
         if self.state != "grace" or not self._matches_turn(event):
+            self.logger.debug(
+                "Speaker candidate ignored: session=%s state=%s turn=%s revision=%s",
+                self.session_id,
+                self.state,
+                event.turn_id,
+                event.turn_revision,
+            )
             return
         self.grace_held = True
         self.grace_changed.set()
+        self.logger.debug(
+            "Speaker grace held by speech candidate: session=%s turn=%s revision=%s remaining=%.3fs",
+            self.session_id,
+            self.turn_id,
+            self.turn_revision,
+            max(0, self.grace_deadline - asyncio.get_running_loop().time()),
+        )
 
     async def _speech_candidate_cancelled(
         self, event: SpeechCandidateCancelledEvent
     ) -> None:
         if self.state != "grace" or not self._matches_turn(event):
+            self.logger.debug(
+                "Speaker candidate cancellation ignored: session=%s state=%s turn=%s revision=%s",
+                self.session_id,
+                self.state,
+                event.turn_id,
+                event.turn_revision,
+            )
             return
         self.grace_held = False
         self.grace_changed.set()
+        self.logger.debug(
+            "Speaker grace candidate released: session=%s turn=%s revision=%s remaining=%.3fs",
+            self.session_id,
+            self.turn_id,
+            self.turn_revision,
+            max(0, self.grace_deadline - asyncio.get_running_loop().time()),
+        )
 
     async def _speech_started(self, event: SpeechStartedEvent) -> None:
+        self.logger.debug(
+            "Speaker speech start handling: session=%s state=%s turn=%s revision=%s reopened=%s current_turn=%s current_revision=%s",
+            self.session_id,
+            self.state,
+            event.turn_id,
+            event.turn_revision,
+            event.reopened,
+            self.turn_id,
+            self.turn_revision,
+        )
         if self.state == "grace" and event.reopened and self.turn_id == event.turn_id:
             if event.turn_revision != self.turn_revision + 1:
                 await self._send_error("invalid_turn_revision", "Reopened turns must increment the revision by one.")
@@ -255,6 +354,13 @@ class SpeakerSession:
             self.state = "capturing"
             self.grace_held = False
             self.grace_changed.set()
+            self.logger.info(
+                "Speaker turn reopened: session=%s turn=%s revision=%s retained_bytes=%s",
+                self.session_id,
+                self.turn_id,
+                self.turn_revision,
+                len(self.audio),
+            )
             return
 
         if self.state in {"grace", "responding"}:
@@ -266,6 +372,7 @@ class SpeakerSession:
         self.turn_id = event.turn_id
         self.turn_revision = event.turn_revision
         self.audio = bytearray()
+        self.received_audio_frames = 0
         self.state = "capturing"
 
     async def _speech_soft_ended(
@@ -285,7 +392,9 @@ class SpeakerSession:
         generation = self.response_generation
         self.current_generation = generation
         self.state = "grace"
-        self.grace_deadline = asyncio.get_running_loop().time() + REOPEN_GRACE_SECONDS
+        self.grace_deadline = (
+            asyncio.get_running_loop().time() + self.reopen_grace_seconds
+        )
         self.grace_held = False
         self.grace_changed.clear()
         self.playback_completed = asyncio.Event()
@@ -298,12 +407,13 @@ class SpeakerSession:
         turn_id = self.turn_id
         revision = self.turn_revision
         self.logger.info(
-            "Speaker soft-end: session=%s turn=%s revision=%s generation=%s bytes=%s",
+            "Speaker soft-end: session=%s turn=%s revision=%s generation=%s bytes=%s grace_seconds=%.3f",
             self.session_id,
             turn_id,
             revision,
             generation,
             len(snapshot),
+            self.reopen_grace_seconds,
         )
         self.pipeline_task = asyncio.create_task(
             self._run_pipeline(turn_id, revision, generation, snapshot)
@@ -496,6 +606,7 @@ class SpeakerSession:
     ) -> None:
         segmenter = SentenceSegmenter()
         first_token = True
+        first_sentence = True
         try:
             assert self.context is not None
             async for token in self.services.stream_text(
@@ -513,8 +624,36 @@ class SpeakerSession:
                         generation,
                     )
                 for sentence in segmenter.feed(token):
+                    if first_sentence:
+                        first_sentence = False
+                        self.logger.info(
+                            "Speaker first complete sentence: session=%s turn=%s revision=%s generation=%s chars=%s",
+                            self.session_id,
+                            turn_id,
+                            revision,
+                            generation,
+                            len(sentence),
+                        )
+                    self.logger.debug(
+                        "Speaker sentence segmented: session=%s turn=%s revision=%s generation=%s chars=%s ellipsis=%s",
+                        self.session_id,
+                        turn_id,
+                        revision,
+                        generation,
+                        len(sentence),
+                        "..." in sentence or "…" in sentence,
+                    )
                     await queue.put(sentence)
             for sentence in segmenter.finish():
+                if first_sentence:
+                    self.logger.info(
+                        "Speaker first complete sentence at stream end: session=%s turn=%s revision=%s generation=%s chars=%s",
+                        self.session_id,
+                        turn_id,
+                        revision,
+                        generation,
+                        len(sentence),
+                    )
                 await queue.put(sentence)
         except asyncio.CancelledError:
             raise
@@ -538,6 +677,15 @@ class SpeakerSession:
                     generation,
                 )
                 return
+            self.logger.debug(
+                "Speaker grace waiting: session=%s turn=%s revision=%s generation=%s remaining=%.3fs held=%s",
+                self.session_id,
+                turn_id,
+                revision,
+                generation,
+                max(0, remaining),
+                self.grace_held,
+            )
             self.grace_changed.clear()
             try:
                 if remaining > 0:
@@ -551,6 +699,13 @@ class SpeakerSession:
         self, event: PlaybackSegmentCompletedEvent
     ) -> None:
         if event.response_generation != self.current_generation:
+            self.logger.debug(
+                "Speaker stale segment acknowledgement dropped: session=%s current_generation=%s event_generation=%s segment=%s",
+                self.session_id,
+                self.current_generation,
+                event.response_generation,
+                event.segment_id,
+            )
             return
         if event.segment_id in self.segment_text:
             self.played_segments.add(event.segment_id)
@@ -588,6 +743,14 @@ class SpeakerSession:
         if text and self.context is not None:
             self.context.history.append({"role": "assistant", "content": text})
         self._invalidate_pipeline()
+        self.logger.info(
+            "Speaker response cancellation: session=%s generation=%s reason=%s acknowledged_segments=%s total_segments=%s",
+            self.session_id,
+            generation,
+            reason,
+            len(self.played_segments),
+            len(self.segment_order),
+        )
         if generation is not None:
             await self._send_json(
                 "response.cancelled",
@@ -625,6 +788,11 @@ class SpeakerSession:
         task = self.pipeline_task
         self.pipeline_task = None
         if task is not None and not task.done():
+            self.logger.debug(
+                "Speaker pipeline invalidated: session=%s task=%s",
+                self.session_id,
+                task.get_name(),
+            )
             task.cancel()
         self.grace_changed.set()
         self.playback_completed.set()

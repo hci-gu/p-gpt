@@ -135,7 +135,19 @@ export const updateChatHistory = async (
 ) => {
   await pb.collection('chat_history').update(recordId, {
     conversation,
-    title: createChatTitle(conversation),
+  })
+
+  notifyChatHistoryUpdated()
+}
+
+export const renameChatHistory = async (recordId: string, title: string) => {
+  const normalizedTitle = title.trim()
+  if (!normalizedTitle) {
+    throw new Error('Chat titles cannot be empty.')
+  }
+
+  await pb.collection('chat_history').update(recordId, {
+    title: normalizedTitle,
   })
 
   notifyChatHistoryUpdated()

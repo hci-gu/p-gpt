@@ -102,14 +102,40 @@ class SentenceSegmenterTests(unittest.TestCase):
     def test_complete_sentences_and_remainder(self):
         segmenter = SentenceSegmenter()
         self.assertEqual(segmenter.feed("Hello world. Still"), ["Hello world."])
-        self.assertEqual(segmenter.feed(" here!"), ["Still here!"])
-        self.assertEqual(segmenter.finish(), [])
+        self.assertEqual(segmenter.feed(" here!"), [])
+        self.assertEqual(segmenter.finish(), ["Still here!"])
 
     def test_long_unpunctuated_text_uses_word_boundary(self):
         segmenter = SentenceSegmenter(maximum_characters=20)
         result = segmenter.feed("one two three four five six")
         self.assertEqual(result, ["one two three four"])
         self.assertEqual(segmenter.finish(), ["five six"])
+
+    def test_streamed_ellipsis_is_one_segment(self):
+        segmenter = SentenceSegmenter()
+
+        self.assertEqual(segmenter.feed("Wait."), [])
+        self.assertEqual(segmenter.feed("."), [])
+        self.assertEqual(segmenter.feed(". I need a moment"), ["Wait..."])
+        self.assertEqual(segmenter.finish(), ["I need a moment"])
+
+    def test_standalone_ellipsis_is_attached_to_following_text(self):
+        segmenter = SentenceSegmenter()
+
+        self.assertEqual(segmenter.feed("First. ... Second."), ["First."])
+        self.assertEqual(segmenter.finish(), ["... Second."])
+
+    def test_unicode_ellipsis_marks_a_pause(self):
+        segmenter = SentenceSegmenter()
+
+        self.assertEqual(segmenter.feed("Let me think… Then"), ["Let me think…"])
+        self.assertEqual(segmenter.finish(), ["Then"])
+
+    def test_punctuation_only_output_is_not_sent_to_tts(self):
+        segmenter = SentenceSegmenter()
+
+        self.assertEqual(segmenter.feed("..."), [])
+        self.assertEqual(segmenter.finish(), [])
 
 
 class ParakeetAdapterTests(unittest.TestCase):
@@ -150,6 +176,7 @@ class SpeakerSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(errors[-1]["code"], "audio_outside_capture")
 
     async def test_pipeline_commits_transcript_and_played_response(self):
+        self.session.reopen_grace_seconds = 0
         with patch("speaker.session.REOPEN_GRACE_SECONDS", 0):
             await self.session._speech_started(
                 event(
@@ -206,6 +233,7 @@ class SpeakerSessionTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_reopen_increments_revision_and_preserves_audio(self):
+        self.session.reopen_grace_seconds = 60
         with patch("speaker.session.REOPEN_GRACE_SECONDS", 60):
             await self.session._speech_started(
                 event(

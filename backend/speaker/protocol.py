@@ -104,6 +104,27 @@ class PlaybackResponseCompletedEvent(ResponseEvent):
     type: Literal["playback.response_completed"]
 
 
+class VadDiagnosticEvent(ClientEvent):
+    type: Literal["client.vad_diagnostic"]
+    activity: Literal[
+        "audio_context",
+        "capture_started",
+        "capture_stalled",
+        "capture_stopped",
+        "inference_timeout",
+        "microphone_ended",
+        "probability_summary",
+        "worker_error",
+        "worker_ready",
+    ]
+    phase: Literal["idle", "capturing", "grace", "responding"]
+    detail: str | None = Field(default=None, max_length=256)
+    sample_count: int | None = Field(default=None, ge=0, le=10_000)
+    probability_min: float | None = Field(default=None, ge=0, le=1)
+    probability_average: float | None = Field(default=None, ge=0, le=1)
+    probability_max: float | None = Field(default=None, ge=0, le=1)
+
+
 SpeakerClientEvent = Annotated[
     SessionConfigureEvent
     | SpeechCandidateEvent
@@ -113,7 +134,8 @@ SpeakerClientEvent = Annotated[
     | InputLimitReachedEvent
     | ResponseCancelEvent
     | PlaybackSegmentCompletedEvent
-    | PlaybackResponseCompletedEvent,
+    | PlaybackResponseCompletedEvent
+    | VadDiagnosticEvent,
     Field(discriminator="type"),
 ]
 

@@ -7,7 +7,7 @@ export const speakerPreRollFrames = 16
 export const speakerMaximumFrames = Math.floor(60_000 / 32)
 
 type VadStateEvent =
-  | SpeakerAudioEvent
+  | Exclude<SpeakerAudioEvent, { type: 'vad-diagnostic' }>
   | { active: boolean; type: 'activity-change' }
 
 export class SpeakerVadStateMachine {

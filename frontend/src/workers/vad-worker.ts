@@ -34,6 +34,7 @@ type VadModel = {
 const modelId = 'BricksDisplay/silero-vad-6.2'
 const modelRevision = '9d91cc0598804f0c00bd8cde231aa86595ec707d'
 const contextSamples = 64
+const inferenceTimeoutMilliseconds = 5_000
 
 let modelPromise: Promise<VadModel> | null = null
 let model: VadModel | null = null
@@ -127,8 +128,26 @@ const evaluateSpeechProbability = async (audio: Float32Array) => {
   return Number(probabilityTensor.data[0] ?? 0)
 }
 
+const withInferenceTimeout = <Value>(promise: Promise<Value>) =>
+  new Promise<Value>((resolve, reject) => {
+    const timeout = setTimeout(
+      () => reject(new Error('Silero VAD inference timed out after 5 seconds.')),
+      inferenceTimeoutMilliseconds
+    )
+    promise.then(
+      (value) => {
+        clearTimeout(timeout)
+        resolve(value)
+      },
+      (error: unknown) => {
+        clearTimeout(timeout)
+        reject(error)
+      }
+    )
+  })
+
 const processAudioFrame = async (audio: Float32Array) => {
-  const probability = await evaluateSpeechProbability(audio)
+  const probability = await withInferenceTimeout(evaluateSpeechProbability(audio))
   postWorkerMessage({ probability, type: 'speech-probability' })
   for (const event of vadState.process(audio, probability)) {
     postWorkerMessage(event)

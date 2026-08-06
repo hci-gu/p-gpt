@@ -17,6 +17,7 @@ from typing import Any, Literal
 from urllib.parse import urlparse
 from uuid import uuid4
 from config import settings
+from logging_config import configure_persistent_logging
 
 import httpx
 import soundfile as sf
@@ -31,6 +32,18 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 # than the root/module logger. Using a child keeps application INFO messages in
 # the same terminal feed as server startup and request logs.
 logger = logging.getLogger("uvicorn.error.p_gpt")
+persistent_log_path = configure_persistent_logging(
+    logger,
+    backup_count=settings.log_backup_count,
+    level_name=settings.log_level,
+    max_bytes=settings.log_max_bytes,
+    path=settings.log_path,
+)
+logger.info(
+    "P-GPT logging configured: level=%s persistent_log=%s",
+    settings.log_level,
+    persistent_log_path,
+)
 logger.info(f"Running mlflow on tracking URI: {mlflow.get_tracking_uri()}")
 
 @asynccontextmanager
@@ -2001,5 +2014,6 @@ async def speaker_websocket(websocket: WebSocket) -> None:
             synthesize=_synthesize_speaker_sentence,
         ),
         logger,
+        reopen_grace_seconds=settings.speaker_reopen_grace_seconds,
     )
     await session.run()
