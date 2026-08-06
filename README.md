@@ -18,11 +18,19 @@ uv sync --extra cuda
 ```
 
 Optionally create `backend/.env` to configure persona extraction retries and
-the backend-owned SQLite prompt cache.
+the backend-owned SQLite prompt cache. Speaker mode lazy-loads the configured
+Qwen Omni checkpoint on its first voice turn; it defaults to the 3B prototype.
 ``` env
 P_GPT_N_RETRIES=3
 P_GPT_PERSONA_PROMPT_CACHE_PATH=persona_prompt_cache.sqlite3
+P_GPT_OMNI_MODEL=Qwen/Qwen2.5-Omni-3B
+P_GPT_OMNI_VOICE=Chelsie
 ```
+
+To test the larger checkpoint later, change `P_GPT_OMNI_MODEL` to
+`Qwen/Qwen3-Omni-30B-A3B-Instruct` and use one of its supported voices such as
+`Ethan`, `Chelsie`, or `Aiden`. The model requires the GPU memory and preview
+Transformers/runtime support described by its model card.
 
 To spin up the FastAPI server
 ``` bash

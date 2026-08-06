@@ -25,6 +25,7 @@ const chatTtsStreamEndpoint = (chatId: string, streaming: boolean) =>
   `${requestApiEndpoint(streaming)}/requests/${chatId}/audio`
 const chatInterruptEndpoint = (chatId: string, streaming: boolean) =>
   `${requestApiEndpoint(streaming)}/requests/${chatId}/interrupt`
+const omniInferenceEndpoint = `${apiEndpoint}/omni/infer`
 
 export interface MessageType {
   key: string
@@ -206,6 +207,110 @@ const fetchTextResponse = async (
   return response.text()
 }
 
+type OmniResponseParameters = {
+  audio: Float32Array
+  inputText: string
+  sampleRate: number
+}
+
+const encodePcm16Wav = (audio: Float32Array, sampleRate: number) => {
+  const buffer = new ArrayBuffer(44 + audio.length * 2)
+  const view = new DataView(buffer)
+  const writeString = (offset: number, value: string) => {
+    for (let index = 0; index < value.length; index += 1) {
+      view.setUint8(offset + index, value.charCodeAt(index))
+    }
+  }
+
+  writeString(0, 'RIFF')
+  view.setUint32(4, 36 + audio.length * 2, true)
+  writeString(8, 'WAVE')
+  writeString(12, 'fmt ')
+  view.setUint32(16, 16, true)
+  view.setUint16(20, 1, true)
+  view.setUint16(22, 1, true)
+  view.setUint32(24, sampleRate, true)
+  view.setUint32(28, sampleRate * 2, true)
+  view.setUint16(32, 2, true)
+  view.setUint16(34, 16, true)
+  writeString(36, 'data')
+  view.setUint32(40, audio.length * 2, true)
+
+  for (let index = 0; index < audio.length; index += 1) {
+    const sample = Math.max(-1, Math.min(1, audio[index] ?? 0))
+    view.setInt16(44 + index * 2, sample * 32_767, true)
+  }
+
+  return new Uint8Array(buffer)
+}
+
+const bytesToBase64 = (bytes: Uint8Array) => {
+  let binary = ''
+  const chunkSize = 0x8000
+
+  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+    binary += String.fromCharCode(
+      ...bytes.subarray(offset, Math.min(bytes.length, offset + chunkSize))
+    )
+  }
+
+  return btoa(binary)
+}
+
+const fetchOmniResponse = async (
+  messages: StoredChatMessage[],
+  personaId: string,
+  personaName: string,
+  instructionPrompt: string,
+  inputText: string,
+  audio: Float32Array,
+  sampleRate: number,
+  signal: AbortSignal
+) => {
+  const response = await fetch(omniInferenceEndpoint, {
+    body: JSON.stringify({
+      audio_base64: bytesToBase64(encodePcm16Wav(audio, sampleRate)),
+      audio_sample_rate: sampleRate,
+      input_text: inputText,
+      instruction_prompt: instructionPrompt,
+      max_tokens: 256,
+      messages,
+      persona_id: personaId,
+      persona_name: personaName,
+      temperature: 0.7,
+      top_p: 0.95,
+    }),
+    headers: {
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+    },
+    method: 'POST',
+    signal,
+  })
+
+  if (!response.ok) {
+    throw new Error(await getApiErrorMessage(response, 'Omni model failed'))
+  }
+
+  const data: unknown = await response.json()
+  if (
+    typeof data !== 'object' ||
+    data === null ||
+    !('generated_text' in data) ||
+    typeof data.generated_text !== 'string'
+  ) {
+    throw new Error('Omni model response did not include generated text.')
+  }
+
+  return {
+    audioBase64:
+      'audio_base64' in data && typeof data.audio_base64 === 'string'
+        ? data.audio_base64
+        : null,
+    text: data.generated_text,
+  }
+}
+
 const toMessageTypes = (conversation: StoredChatMessage[]): MessageType[] =>
   conversation.map((message) => {
     const messageId = createMessageId(message.role)
@@ -262,6 +367,11 @@ interface ChatState {
     messageId: string,
     history: StoredChatMessage[]
   ) => Promise<void>
+  fetchOmniAssistantResponse: (
+    messageId: string,
+    history: StoredChatMessage[],
+    parameters: OmniResponseParameters
+  ) => Promise<void>
   persistConversation: (conversation: StoredChatMessage[]) => void
   resetForAuthChange: () => void
   startNewChat: () => void
@@ -274,6 +384,11 @@ interface ChatState {
   selectPersonaForNewChat: (personaId: string) => void
   addUserMessage: (content: string) => void
   submitMessage: (content: string) => void
+  submitOmniAudio: (
+    content: string,
+    audio: Float32Array,
+    sampleRate: number
+  ) => void
 }
 
 export const useChatStore = create<ChatState>((set, get) => ({
@@ -584,6 +699,69 @@ export const useChatStore = create<ChatState>((set, get) => ({
       )
     }
   },
+  fetchOmniAssistantResponse: async (messageId, history, parameters) => {
+    const abortController = new AbortController()
+
+    set({
+      activeRequestAbortController: abortController,
+      activeRequestId: null,
+      activeRequestStreaming: false,
+      status: 'streaming',
+      streamingMessageId: messageId,
+    })
+
+    try {
+      try {
+        await usePersonasStore.getState().ensurePersonasLoaded()
+      } catch {
+        // Persona loading should not prevent the user from chatting.
+      }
+
+      const personasState = usePersonasStore.getState()
+      const personaId = get().activePersonaId ?? personasState.selectedPersonaId
+      const persona = personasState.personas.find(
+        (candidate) => candidate.id === personaId
+      )
+      if (!persona) {
+        throw new Error('A valid persona must be selected before chatting.')
+      }
+
+      const response = await fetchOmniResponse(
+        history,
+        persona.id,
+        persona.name,
+        persona.instructionPrompt,
+        parameters.inputText,
+        parameters.audio,
+        parameters.sampleRate,
+        abortController.signal
+      )
+
+      if (get().streamingMessageId !== messageId) {
+        return
+      }
+
+      get().updateMessageContent(messageId, response.text)
+      if (response.audioBase64) {
+        get().updateMessageAudio(
+          messageId,
+          `data:audio/pcm;base64,${response.audioBase64}`
+        )
+      } else {
+        get().completeAssistantResponse(messageId)
+      }
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') {
+        return
+      }
+      get().failAssistantResponse(
+        messageId,
+        error instanceof Error
+          ? error.message
+          : 'Omni model failed: unknown error.'
+      )
+    }
+  },
   persistConversation: (conversation) => {
     if (conversation.length === 0) {
       return
@@ -775,5 +953,44 @@ export const useChatStore = create<ChatState>((set, get) => ({
   submitMessage: (content) => {
     set({ status: 'submitted', text: '' })
     get().addUserMessage(content)
+  },
+  submitOmniAudio: (content, audio, sampleRate) => {
+    const userMessageId = createMessageId('user')
+    const userMessage: MessageType = {
+      from: 'user',
+      key: userMessageId,
+      versions: [
+        {
+          content: content.trim() || 'Voice input',
+          contentStatus: 'ready',
+          id: userMessageId,
+        },
+      ],
+    }
+    const history = toChatHistory([...get().messages, userMessage])
+    const assistantMessageId = createMessageId('assistant')
+    const assistantMessage: MessageType = {
+      from: 'assistant',
+      key: assistantMessageId,
+      versions: [
+        {
+          audioPlaybackComplete: false,
+          content: '',
+          contentStatus: 'pending',
+          id: assistantMessageId,
+        },
+      ],
+    }
+
+    set((state) => ({
+      messages: [...state.messages, userMessage, assistantMessage],
+      status: 'submitted',
+    }))
+    get().persistConversation(history)
+    void get().fetchOmniAssistantResponse(assistantMessageId, history, {
+      audio,
+      inputText: content,
+      sampleRate,
+    })
   },
 }))

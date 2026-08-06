@@ -37,7 +37,10 @@ import {
   SourcesTrigger,
 } from '@/components/ai-elements/sources'
 import { SpeechInput } from '@/components/ai-elements/speech-input'
-import type { TranscriptionEvent } from '@/components/ai-elements/speech-input'
+import type {
+  AudioCaptureEvent,
+  TranscriptionEvent,
+} from '@/components/ai-elements/speech-input'
 import { Suggestions } from '@/components/ai-elements/suggestion'
 import { Spinner } from '@/components/ui/spinner'
 import { Slider } from '@/components/ui/slider'
@@ -150,6 +153,7 @@ const ChatPage = () => {
     (state) => state.finishTranscriptionDraft
   )
   const submitMessage = useChatStore((state) => state.submitMessage)
+  const submitOmniAudio = useChatStore((state) => state.submitOmniAudio)
   const completeAssistantResponse = useChatStore(
     (state) => state.completeAssistantResponse
   )
@@ -167,6 +171,8 @@ const ChatPage = () => {
   const [completedAssistantMessageId, setCompletedAssistantMessageId] =
     useState<string | null>(null)
   const transcriptionAnimationRef = useRef<number | null>(null)
+  const capturedAudioRef = useRef(new Map<string, AudioCaptureEvent>())
+  const isGenerating = status === 'submitted' || status === 'streaming'
 
   const handleSubmit = useCallback(
     (message: PromptInputMessage) => {
@@ -197,8 +203,21 @@ const ChatPage = () => {
 
       if (isVoiceOnlyMode) {
         const transcript = event.text.trim()
+        const capturedAudio = capturedAudioRef.current.get(event.sessionId)
+        capturedAudioRef.current.delete(event.sessionId)
 
-        if (transcript) {
+        if (isGenerating) {
+          setIsTranscribing(false)
+          return
+        }
+
+        if (transcript && capturedAudio) {
+          submitOmniAudio(
+            transcript,
+            capturedAudio.audio,
+            capturedAudio.sampleRate
+          )
+        } else if (transcript) {
           submitMessage(transcript)
         }
 
@@ -248,10 +267,16 @@ const ChatPage = () => {
     [
       finishTranscriptionDraft,
       isVoiceOnlyMode,
+      isGenerating,
+      submitOmniAudio,
       submitMessage,
       updateTranscriptionDraft,
     ]
   )
+
+  const handleAudioFinal = useCallback((event: AudioCaptureEvent) => {
+    capturedAudioRef.current.set(event.sessionId, event)
+  }, [])
 
   const handleTranscriptionStart = useCallback(
     (sessionId: string) => {
@@ -306,7 +331,6 @@ const ChatPage = () => {
     )
   }, [])
 
-  const isGenerating = status === 'submitted' || status === 'streaming'
   const isSubmitDisabled = useMemo(
     () => !isGenerating && (!text.trim() || isTranscribing),
     [isGenerating, isTranscribing, text]
@@ -477,13 +501,13 @@ const ChatPage = () => {
               <SpeechInput
                 className="shrink-0"
                 defaultLanguage="en"
-                disabled={isGenerating}
+                alwaysOn
                 onTranscriptionChange={handleTranscriptionChange}
                 onTranscriptionProcessingChange={
                   handleTranscriptionProcessingChange
                 }
                 onTranscriptionStart={handleTranscriptionStart}
-                showMicrophone={false}
+                onAudioFinal={handleAudioFinal}
                 size="icon-sm"
                 variant="ghost"
               />

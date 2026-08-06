@@ -4,7 +4,7 @@ import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { cn } from "@/lib/utils";
 import { usePreferencesStore } from "@/src/state/preferences";
-import { LanguagesIcon, MicIcon, SquareIcon } from "lucide-react";
+import { LanguagesIcon, MicIcon, MicOffIcon, SquareIcon } from "lucide-react";
 import type { ComponentProps } from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type {
@@ -32,6 +32,12 @@ export interface TranscriptionEvent {
   text: string;
 }
 
+export interface AudioCaptureEvent {
+  audio: Float32Array;
+  sampleRate: number;
+  sessionId: string;
+}
+
 export type SpeechInputProps = Omit<
   ComponentProps<typeof Button>,
   "onError"
@@ -41,6 +47,8 @@ export type SpeechInputProps = Omit<
   onTranscriptionError?: (error: string) => void;
   onTranscriptionProcessingChange?: (isProcessing: boolean) => void;
   onTranscriptionStart?: (sessionId: string) => void;
+  onAudioFinal?: (event: AudioCaptureEvent) => void;
+  alwaysOn?: boolean;
   showMicrophone?: boolean;
 };
 
@@ -48,6 +56,8 @@ const targetSampleRate = 16_000;
 const partialIntervalMs = 1400;
 const rollingWindowSeconds = 12;
 const maxFinalSeconds = 120;
+const speechThreshold = 0.015;
+const silenceDurationMs = 900;
 
 const getAudioContextConstructor = () =>
   window.AudioContext ?? (window as BrowserWindow).webkitAudioContext;
@@ -116,6 +126,8 @@ export const SpeechInput = ({
   onTranscriptionError,
   onTranscriptionProcessingChange,
   onTranscriptionStart,
+  onAudioFinal,
+  alwaysOn = false,
   showMicrophone = true,
   ...props
 }: SpeechInputProps) => {
@@ -124,10 +136,14 @@ export const SpeechInput = ({
     (state) => state.generationParameters.asrModel
   );
   const [status, setStatus] = useState<SpeechInputStatus>("idle");
+  const [isMuted, setIsMuted] = useState(false);
   const [isSupported] = useState(isSpeechInputSupported);
   const audioContextRef = useRef<AudioContext | null>(null);
   const fullChunksRef = useRef<Float32Array[]>([]);
   const isRecordingRef = useRef(false);
+  const isMutedRef = useRef(false);
+  const speechStartedRef = useRef(false);
+  const lastSpeechAtRef = useRef(0);
   const lastPartialSentAtRef = useRef(0);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
   const rollingChunksRef = useRef<Float32Array[]>([]);
@@ -146,11 +162,15 @@ export const SpeechInput = ({
   >(onTranscriptionProcessingChange);
   const onTranscriptionStartRef =
     useRef<SpeechInputProps["onTranscriptionStart"]>(onTranscriptionStart);
+  const onAudioFinalRef = useRef<SpeechInputProps["onAudioFinal"]>(onAudioFinal);
+  const alwaysOnRef = useRef(alwaysOn);
 
   onTranscriptionChangeRef.current = onTranscriptionChange;
   onTranscriptionErrorRef.current = onTranscriptionError;
   onTranscriptionProcessingChangeRef.current = onTranscriptionProcessingChange;
   onTranscriptionStartRef.current = onTranscriptionStart;
+  onAudioFinalRef.current = onAudioFinal;
+  alwaysOnRef.current = alwaysOn;
 
   const postWorkerMessage = useCallback((message: AsrWorkerRequest) => {
     if (message.type === "transcribe") {
@@ -202,7 +222,9 @@ export const SpeechInput = ({
       });
 
       if (message.isFinal) {
-        setStatus("idle");
+        setStatus(
+          alwaysOnRef.current && isRecordingRef.current ? "recording" : "idle"
+        );
       }
     });
 
@@ -225,6 +247,14 @@ export const SpeechInput = ({
         isFinal ? sourceSampleRate * maxFinalSeconds : undefined
       );
       const audio = resampleToTargetRate(sourceAudio, sourceSampleRate);
+
+      if (isFinal && alwaysOnRef.current) {
+        onAudioFinalRef.current?.({
+          audio: audio.slice(),
+          sampleRate: targetSampleRate,
+          sessionId,
+        });
+      }
 
       postWorkerMessage({
         audio,
@@ -262,7 +292,12 @@ export const SpeechInput = ({
   }, []);
 
   const startRecording = useCallback(async () => {
-    if (!isSupported || status === "loading") {
+    if (
+      !isSupported ||
+      status === "loading" ||
+      isRecordingRef.current ||
+      isMutedRef.current
+    ) {
       return;
     }
 
@@ -310,7 +345,7 @@ export const SpeechInput = ({
       isRecordingRef.current = true;
 
       processor.onaudioprocess = (event) => {
-        if (!isRecordingRef.current) {
+        if (!isRecordingRef.current || isMutedRef.current) {
           return;
         }
 
@@ -332,6 +367,28 @@ export const SpeechInput = ({
         }
 
         const now = performance.now();
+
+        let totalLevel = 0;
+        for (const sample of input) {
+          totalLevel += Math.abs(sample);
+        }
+        const level = input.length ? totalLevel / input.length : 0;
+        if (level >= speechThreshold) {
+          speechStartedRef.current = true;
+          lastSpeechAtRef.current = now;
+        } else if (
+          alwaysOnRef.current &&
+          speechStartedRef.current &&
+          now - lastSpeechAtRef.current >= silenceDurationMs
+        ) {
+          sendTranscriptionWindow(true);
+          fullChunksRef.current = [];
+          rollingChunksRef.current = [];
+          rollingSampleCountRef.current = 0;
+          speechStartedRef.current = false;
+          lastSpeechAtRef.current = now;
+          return;
+        }
 
         if (now - lastPartialSentAtRef.current >= partialIntervalMs) {
           lastPartialSentAtRef.current = now;
@@ -368,13 +425,35 @@ export const SpeechInput = ({
   }, [cleanupAudio, sendTranscriptionWindow]);
 
   const toggleRecording = useCallback(() => {
+    if (alwaysOn) {
+      const nextMuted = !isMutedRef.current;
+      isMutedRef.current = nextMuted;
+      setIsMuted(nextMuted);
+      for (const track of streamRef.current?.getAudioTracks() ?? []) {
+        track.enabled = !nextMuted;
+      }
+      if (nextMuted) {
+        fullChunksRef.current = [];
+        rollingChunksRef.current = [];
+        rollingSampleCountRef.current = 0;
+        speechStartedRef.current = false;
+      }
+      return;
+    }
+
     if (status === "recording") {
       void stopRecording();
       return;
     }
 
     void startRecording();
-  }, [startRecording, status, stopRecording]);
+  }, [alwaysOn, startRecording, status, stopRecording]);
+
+  useEffect(() => {
+    if (alwaysOn) {
+      void startRecording();
+    }
+  }, [alwaysOn, startRecording]);
 
   const toggleLanguage = useCallback(() => {
     setLanguage((currentLanguage) => {
@@ -387,6 +466,7 @@ export const SpeechInput = ({
   useEffect(
     () => () => {
       isRecordingRef.current = false;
+      isMutedRef.current = false;
       void cleanupAudio();
       workerRef.current?.terminate();
       workerRef.current = null;
@@ -396,7 +476,11 @@ export const SpeechInput = ({
 
   const isLoading = status === "loading" || status === "transcribing";
   const isRecording = status === "recording";
-  const isDisabled = disabled || !isSupported || status === "error" || isLoading;
+  const isDisabled =
+    disabled ||
+    !isSupported ||
+    status === "error" ||
+    (alwaysOn ? status === "loading" : isLoading);
 
   return (
     <div className="inline-flex items-center gap-0.5">
@@ -416,6 +500,7 @@ export const SpeechInput = ({
       {showMicrophone && (
         <div className="relative inline-flex items-center justify-center">
           {isRecording &&
+            !isMuted &&
             [0, 1, 2].map((index) => (
               <div
                 className="absolute inset-0 animate-ping rounded-full border-2 border-red-400/30"
@@ -427,10 +512,22 @@ export const SpeechInput = ({
               />
             ))}
           <Button
-            aria-label={isRecording ? "Stop transcription" : "Start transcription"}
+            aria-label={
+              alwaysOn
+                ? isMuted
+                  ? "Unmute microphone"
+                  : "Mute microphone"
+                : isRecording
+                  ? "Stop transcription"
+                  : "Start transcription"
+            }
             className={cn(
               "relative z-10 size-8 rounded-full border border-border/25 bg-accent/10 shadow-[0_1px_2px_hsl(0_0%_0%/0.04)] transition-all duration-300 hover:bg-accent",
               isRecording &&
+              !alwaysOn &&
+                "bg-destructive text-white hover:bg-destructive/80 hover:text-white",
+              alwaysOn &&
+                isMuted &&
                 "bg-destructive text-white hover:bg-destructive/80 hover:text-white",
               className
             )}
@@ -439,9 +536,15 @@ export const SpeechInput = ({
             type="button"
             {...props}
           >
-            {isLoading && <Spinner />}
-            {!isLoading && isRecording && <SquareIcon className="size-4" />}
-            {!(isLoading || isRecording) && <MicIcon className="size-4" />}
+            {!alwaysOn && isLoading && <Spinner />}
+            {!alwaysOn && !isLoading && isRecording && (
+              <SquareIcon className="size-4" />
+            )}
+            {alwaysOn && isMuted && <MicOffIcon className="size-4" />}
+            {alwaysOn && !isMuted && <MicIcon className="size-4" />}
+            {!alwaysOn && !(isLoading || isRecording) && (
+              <MicIcon className="size-4" />
+            )}
           </Button>
         </div>
       )}

@@ -1,4 +1,5 @@
 import asyncio
+import base64
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 import hashlib
@@ -12,6 +13,7 @@ from pathlib import Path
 import re
 import sqlite3
 from time import perf_counter, time
+from tempfile import NamedTemporaryFile
 from typing import Any, Literal
 from urllib.parse import urlparse
 from uuid import uuid4
@@ -24,6 +26,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from omnivoice import OmniVoice, VoiceClonePrompt
+from omni_model import QwenOmniModel, build_messages
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
 # FastAPI's development runner configures the Uvicorn logger hierarchy rather
@@ -49,6 +52,8 @@ async def lifespan(app: FastAPI):
     )
     app.state.tts_model = model
     app.state.tts_lock = asyncio.Lock()
+    app.state.omni_model = None
+    app.state.omni_model_lock = asyncio.Lock()
     app.state.voice_clone_prompts = {}
     app.state.voice_clone_prompt_tasks = {}
     persona_preparations.clear()
@@ -89,6 +94,8 @@ async def lifespan(app: FastAPI):
         app.state.voice_clone_prompt_tasks.clear()
         del app.state.default_voice_clone_prompt
         del app.state.tts_model
+        if app.state.omni_model is not None:
+            del app.state.omni_model
         del model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -253,6 +260,20 @@ class OllamaModelsResponse(BaseModel):
     used_fallback: bool
 
 
+class OmniChatRequest(BaseModel):
+    persona_id: str = Field(min_length=1)
+    persona_name: str = Field(min_length=1)
+    instruction_prompt: str = Field(min_length=1)
+    messages: list[ChatMessage] = Field(default_factory=list)
+    audio_base64: str = Field(min_length=1)
+    audio_sample_rate: int = Field(default=16_000, gt=0)
+    input_text: str = ""
+    max_tokens: int = Field(default=256, ge=1, le=8192)
+    temperature: float = Field(default=0.7, ge=0, le=2)
+    top_p: float = Field(default=0.95, gt=0, le=1)
+    speaker: str = settings.omni_voice
+
+
 PERSONA_EXTRACTION_SEED = 0
 PERSONA_EXTRACTION_TEMPERATURE = 0
 PERSONA_EXTRACTION_INSTRUCTION = """
@@ -312,6 +333,38 @@ async def _validate_conversation_model(model: str) -> None:
             status_code=422,
             detail=f"The selected Ollama model is not available: {model}",
         )
+
+
+async def _get_omni_model() -> QwenOmniModel:
+    if app.state.omni_model is not None:
+        return app.state.omni_model
+
+    async with app.state.omni_model_lock:
+        if app.state.omni_model is None:
+            logger.info("Loading Qwen Omni model: %s", settings.omni_model)
+            app.state.omni_model = await asyncio.to_thread(
+                QwenOmniModel,
+                settings.omni_model,
+            )
+            logger.info("Qwen Omni model is online: %s", settings.omni_model)
+    return app.state.omni_model
+
+
+def _decode_omni_audio(request: OmniChatRequest) -> tuple[Any, int]:
+    try:
+        audio_bytes = base64.b64decode(request.audio_base64, validate=True)
+        audio, sample_rate = sf.read(
+            BytesIO(audio_bytes),
+            dtype="float32",
+            always_2d=False,
+        )
+    except (ValueError, RuntimeError, TypeError) as exc:
+        raise HTTPException(status_code=422, detail="Invalid microphone audio.") from exc
+
+    if not getattr(audio, "size", 0):
+        raise HTTPException(status_code=422, detail="Microphone audio is empty.")
+
+    return audio, int(sample_rate)
 
 
 def load_prompt():
@@ -1409,6 +1462,60 @@ def _interrupt_request_state(request_id: str, state: RequestState) -> dict[str, 
 async def get_ollama_models() -> OllamaModelsResponse:
     """Return conversation models available through the configured Ollama server."""
     return await _get_available_ollama_models()
+
+
+@app.post("/omni/infer")
+async def infer_omni(request: OmniChatRequest) -> dict[str, Any]:
+    """Run one audio-in/audio-out Qwen Omni turn.
+
+    Audio is sent as a short WAV data URL from the browser. The model itself
+    receives the audio alongside the conversation, so browser ASR is only used
+    to keep the visible chat history readable.
+    """
+    audio, sample_rate = _decode_omni_audio(request)
+    system_prompt = await _resolve_persona_system_prompt(
+        request.persona_id,
+        request.persona_name,
+        request.instruction_prompt,
+    )
+
+    with NamedTemporaryFile(suffix=".wav", delete=False) as temporary:
+        input_path = Path(temporary.name)
+
+    try:
+        sf.write(input_path, audio, sample_rate, format="WAV", subtype="PCM_16")
+        messages = build_messages(
+            system_prompt,
+            [message.model_dump() for message in request.messages],
+            str(input_path),
+            request.input_text,
+        )
+        model = await _get_omni_model()
+        async with app.state.omni_model_lock:
+            generated_text, generated_audio = await asyncio.to_thread(
+                model.generate,
+                messages,
+                audio,
+                sample_rate,
+                request.speaker,
+                request.max_tokens,
+                request.temperature,
+                request.top_p,
+            )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Qwen Omni inference failed")
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    finally:
+        input_path.unlink(missing_ok=True)
+
+    return {
+        "model": settings.omni_model,
+        "generated_text": generated_text,
+        "audio_base64": base64.b64encode(generated_audio).decode("ascii"),
+        "audio_sample_rate": 24_000,
+    }
 
 
 @app.post("/persona-preparations")
