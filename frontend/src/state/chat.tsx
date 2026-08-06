@@ -213,6 +213,8 @@ type OmniResponseParameters = {
   sampleRate: number
 }
 
+type QueuedOmniAudio = OmniResponseParameters
+
 const encodePcm16Wav = (audio: Float32Array, sampleRate: number) => {
   const buffer = new ArrayBuffer(44 + audio.length * 2)
   const view = new DataView(buffer)
@@ -349,6 +351,7 @@ interface ChatState {
   activeHistoryId: string | null
   activeChatKey: string
   activePersonaId: string | null
+  queuedOmniAudio: QueuedOmniAudio | null
   setText: (text: string) => void
   beginTranscriptionDraft: (sessionId: string) => void
   updateTranscriptionDraft: (sessionId: string, transcript: string) => void
@@ -391,7 +394,71 @@ interface ChatState {
   ) => void
 }
 
-export const useChatStore = create<ChatState>((set, get) => ({
+export const useChatStore = create<ChatState>((set, get) => {
+  const startOmniAudio = (
+    content: string,
+    audio: Float32Array,
+    sampleRate: number
+  ) => {
+    const userMessageId = createMessageId('user')
+    const userMessage: MessageType = {
+      from: 'user',
+      key: userMessageId,
+      versions: [
+        {
+          content: content.trim() || 'Voice input',
+          contentStatus: 'ready',
+          id: userMessageId,
+        },
+      ],
+    }
+    const history = toChatHistory([...get().messages, userMessage])
+    const assistantMessageId = createMessageId('assistant')
+    const assistantMessage: MessageType = {
+      from: 'assistant',
+      key: assistantMessageId,
+      versions: [
+        {
+          audioPlaybackComplete: false,
+          content: '',
+          contentStatus: 'pending',
+          id: assistantMessageId,
+        },
+      ],
+    }
+
+    set((state) => ({
+      messages: [...state.messages, userMessage, assistantMessage],
+      status: 'submitted',
+    }))
+    get().persistConversation(history)
+    void get().fetchOmniAssistantResponse(assistantMessageId, history, {
+      audio,
+      inputText: content,
+      sampleRate,
+    })
+  }
+
+  const drainQueuedOmniAudio = () => {
+    const state = get()
+    if (
+      !state.queuedOmniAudio ||
+      state.status === 'submitted' ||
+      state.status === 'streaming'
+    ) {
+      return
+    }
+
+    const queuedAudio = state.queuedOmniAudio
+    set({ queuedOmniAudio: null })
+    startOmniAudio(
+      queuedAudio.inputText,
+      queuedAudio.audio,
+      queuedAudio.sampleRate
+    )
+  }
+
+  return {
   text: '',
   transcriptionDraft: null,
   useWebSearch: false,
@@ -404,6 +471,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   activeHistoryId: null,
   activeChatKey: createMessageId('chat'),
   activePersonaId: usePersonasStore.getState().selectedPersonaId,
+  queuedOmniAudio: null,
   setText: (text) => {
     set({ text, transcriptionDraft: null })
   },
@@ -519,6 +587,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       }
     })
     get().persistConversation(toChatHistory(get().messages))
+    drainQueuedOmniAudio()
   },
   failAssistantResponse: (messageId, errorMessage, preserveContent = false) => {
     set((state) => ({
@@ -552,6 +621,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       streamingMessageId: null,
     }))
     get().persistConversation(toChatHistory(get().messages))
+    drainQueuedOmniAudio()
   },
   interruptAssistantResponse: async () => {
     const {
@@ -594,6 +664,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     get().persistConversation(toChatHistory(get().messages))
 
     if (!activeRequestId) {
+      drainQueuedOmniAudio()
       return
     }
 
@@ -604,6 +675,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     } catch {
       // The local abort has already restored the UI; backend cleanup is best effort.
     }
+    drainQueuedOmniAudio()
   },
   fetchAssistantResponse: async (messageId, history) => {
     const abortController = new AbortController()
@@ -830,6 +902,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       streamingMessageId: null,
       text: '',
       transcriptionDraft: null,
+      queuedOmniAudio: null,
       useWebSearch: false,
     })
   },
@@ -847,6 +920,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       streamingMessageId: null,
       text: '',
       transcriptionDraft: null,
+      queuedOmniAudio: null,
     })
   },
   clearDeletedChat: (recordId) => {
@@ -874,6 +948,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       streamingMessageId: null,
       text: '',
       transcriptionDraft: null,
+      queuedOmniAudio: null,
     })
 
     if (activeRequestId) {
@@ -905,6 +980,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       streamingMessageId: null,
       text: '',
       transcriptionDraft: null,
+      queuedOmniAudio: null,
     })
   },
   selectPersonaForNewChat: (personaId) => {
@@ -955,42 +1031,21 @@ export const useChatStore = create<ChatState>((set, get) => ({
     get().addUserMessage(content)
   },
   submitOmniAudio: (content, audio, sampleRate) => {
-    const userMessageId = createMessageId('user')
-    const userMessage: MessageType = {
-      from: 'user',
-      key: userMessageId,
-      versions: [
-        {
-          content: content.trim() || 'Voice input',
-          contentStatus: 'ready',
-          id: userMessageId,
-        },
-      ],
-    }
-    const history = toChatHistory([...get().messages, userMessage])
-    const assistantMessageId = createMessageId('assistant')
-    const assistantMessage: MessageType = {
-      from: 'assistant',
-      key: assistantMessageId,
-      versions: [
-        {
-          audioPlaybackComplete: false,
-          content: '',
-          contentStatus: 'pending',
-          id: assistantMessageId,
-        },
-      ],
+    const state = get()
+    if (state.status === 'submitted' || state.status === 'streaming') {
+      if (!state.queuedOmniAudio) {
+        set({
+          queuedOmniAudio: {
+            audio,
+            inputText: content,
+            sampleRate,
+          },
+        })
+      }
+      return
     }
 
-    set((state) => ({
-      messages: [...state.messages, userMessage, assistantMessage],
-      status: 'submitted',
-    }))
-    get().persistConversation(history)
-    void get().fetchOmniAssistantResponse(assistantMessageId, history, {
-      audio,
-      inputText: content,
-      sampleRate,
-    })
+    startOmniAudio(content, audio, sampleRate)
   },
-}))
+  }
+})

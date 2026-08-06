@@ -7,6 +7,9 @@ from typing import Any
 import soundfile as sf
 
 
+logger = logging.getLogger("uvicorn.error.p_gpt")
+
+
 QWEN_SYSTEM_PROMPT = (
     "You are Qwen, a virtual human capable of perceiving auditory inputs "
     "and generating concise, natural text and speech responses."
@@ -84,8 +87,6 @@ class QwenOmniModel:
     def generate(
         self,
         messages: list[dict[str, Any]],
-        audio: Any,
-        sample_rate: int,
         speaker: str,
         max_tokens: int,
         temperature: float,
@@ -93,80 +94,83 @@ class QwenOmniModel:
     ) -> tuple[str, bytes]:
         from qwen_omni_utils import process_mm_info
 
-        with NamedTemporaryFile(suffix=".wav", delete=False) as temporary:
-            input_path = Path(temporary.name)
+        conversation = [*messages]
+        text = self.processor.apply_chat_template(
+            conversation,
+            add_generation_prompt=True,
+            tokenize=False,
+        )
+        audios, images, videos = process_mm_info(
+            conversation,
+            use_audio_in_video=False,
+        )
+        audio_item_count = len(audios) if audios is not None else 0
+        if audio_item_count == 0:
+            raise RuntimeError(
+                "Qwen Omni received no audio item from the conversation."
+            )
+        logger.info(
+            "Qwen Omni prepared %d audio item(s) for the processor.",
+            audio_item_count,
+        )
 
+        inputs = self.processor(
+            text=text,
+            audio=audios,
+            images=images,
+            videos=videos,
+            return_tensors="pt",
+            padding=True,
+            use_audio_in_video=False,
+        )
+        inputs = inputs.to(self.model.device).to(self.model.dtype)
+
+        generation_kwargs: dict[str, Any] = {
+            "max_new_tokens": max_tokens,
+            "temperature": temperature,
+            "top_p": top_p,
+            "speaker": speaker,
+            "use_audio_in_video": False,
+        }
+        if self.is_qwen3:
+            generation_kwargs["thinker_return_dict_in_generate"] = True
+
+        with self.torch.inference_mode():
+            text_ids, audio_output = self.model.generate(
+                **inputs,
+                **generation_kwargs,
+            )
+
+        if self.is_qwen3:
+            text_ids = text_ids.sequences[:, inputs["input_ids"].shape[1] :]
+        decoded = self.processor.batch_decode(
+            text_ids,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+        generated_text = decoded[0].strip() if decoded else ""
+        if not generated_text:
+            raise RuntimeError("Qwen Omni generated no text.")
+
+        if audio_output is None:
+            raise RuntimeError("Qwen Omni generated no audio.")
+
+        audio_array = audio_output.reshape(-1).detach().float().cpu().numpy()
+        output = NamedTemporaryFile(suffix=".pcm", delete=False)
+        output_path = Path(output.name)
+        output.close()
         try:
-            sf.write(input_path, audio, sample_rate, format="WAV", subtype="PCM_16")
-            conversation = [*messages]
-            text = self.processor.apply_chat_template(
-                conversation,
-                add_generation_prompt=True,
-                tokenize=False,
+            sf.write(
+                output_path,
+                audio_array,
+                24_000,
+                format="RAW",
+                subtype="PCM_16",
+                endian="LITTLE",
             )
-            audios, images, videos = process_mm_info(
-                conversation,
-                use_audio_in_video=False,
-            )
-            inputs = self.processor(
-                text=text,
-                audio=audios,
-                images=images,
-                videos=videos,
-                return_tensors="pt",
-                padding=True,
-                use_audio_in_video=False,
-            )
-            inputs = inputs.to(self.model.device).to(self.model.dtype)
-
-            generation_kwargs: dict[str, Any] = {
-                "max_new_tokens": max_tokens,
-                "temperature": temperature,
-                "top_p": top_p,
-                "speaker": speaker,
-                "use_audio_in_video": False,
-            }
-            if self.is_qwen3:
-                generation_kwargs["thinker_return_dict_in_generate"] = True
-
-            with self.torch.inference_mode():
-                text_ids, audio_output = self.model.generate(
-                    **inputs,
-                    **generation_kwargs,
-                )
-
-            if self.is_qwen3:
-                text_ids = text_ids.sequences[:, inputs["input_ids"].shape[1] :]
-            decoded = self.processor.batch_decode(
-                text_ids,
-                skip_special_tokens=True,
-                clean_up_tokenization_spaces=False,
-            )
-            generated_text = decoded[0].strip() if decoded else ""
-            if not generated_text:
-                raise RuntimeError("Qwen Omni generated no text.")
-
-            if audio_output is None:
-                raise RuntimeError("Qwen Omni generated no audio.")
-
-            audio_array = audio_output.reshape(-1).detach().float().cpu().numpy()
-            output = NamedTemporaryFile(suffix=".pcm", delete=False)
-            output_path = Path(output.name)
-            output.close()
-            try:
-                sf.write(
-                    output_path,
-                    audio_array,
-                    24_000,
-                    format="RAW",
-                    subtype="PCM_16",
-                    endian="LITTLE",
-                )
-                return generated_text, output_path.read_bytes()
-            finally:
-                output_path.unlink(missing_ok=True)
+            return generated_text, output_path.read_bytes()
         finally:
-            input_path.unlink(missing_ok=True)
+            output_path.unlink(missing_ok=True)
 
 
 def build_messages(

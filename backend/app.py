@@ -367,6 +367,17 @@ def _decode_omni_audio(request: OmniChatRequest) -> tuple[Any, int]:
     return audio, int(sample_rate)
 
 
+def _omni_audio_metrics(audio: Any, sample_rate: int) -> tuple[int, float, float]:
+    shape = getattr(audio, "shape", ())
+    sample_count = int(shape[0]) if len(shape) else int(getattr(audio, "size", 0))
+    try:
+        rms = math.sqrt(float((audio * audio).mean()))
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        rms = 0.0
+    duration_ms = sample_count / sample_rate * 1000 if sample_rate else 0.0
+    return sample_count, duration_ms, rms
+
+
 def load_prompt():
     separator = "/" if isinstance(settings.mlflow_prompt_version, int) else "@"
     prompt_uri = (
@@ -1468,9 +1479,8 @@ async def get_ollama_models() -> OllamaModelsResponse:
 async def infer_omni(request: OmniChatRequest) -> dict[str, Any]:
     """Run one audio-in/audio-out Qwen Omni turn.
 
-    Audio is sent as a short WAV data URL from the browser. The model itself
-    receives the audio alongside the conversation, so browser ASR is only used
-    to keep the visible chat history readable.
+    Audio is sent as a short WAV data URL from the browser and passed to Qwen
+    as an audio content item in the conversation.
     """
     audio, sample_rate = _decode_omni_audio(request)
     system_prompt = await _resolve_persona_system_prompt(
@@ -1484,6 +1494,17 @@ async def infer_omni(request: OmniChatRequest) -> dict[str, Any]:
 
     try:
         sf.write(input_path, audio, sample_rate, format="WAV", subtype="PCM_16")
+        sample_count, duration_ms, rms = _omni_audio_metrics(audio, sample_rate)
+        logger.info(
+            "Qwen Omni input audio: decoded_sample_rate=%d requested_sample_rate=%d "
+            "samples=%d duration_ms=%.1f rms=%.6f wav_bytes=%d",
+            sample_rate,
+            request.audio_sample_rate,
+            sample_count,
+            duration_ms,
+            rms,
+            input_path.stat().st_size,
+        )
         messages = build_messages(
             system_prompt,
             [message.model_dump() for message in request.messages],
@@ -1495,8 +1516,6 @@ async def infer_omni(request: OmniChatRequest) -> dict[str, Any]:
             generated_text, generated_audio = await asyncio.to_thread(
                 model.generate,
                 messages,
-                audio,
-                sample_rate,
                 request.speaker,
                 request.max_tokens,
                 request.temperature,

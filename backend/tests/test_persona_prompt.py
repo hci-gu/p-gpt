@@ -31,6 +31,7 @@ fake_omnivoice.VoiceClonePrompt = type("VoiceClonePrompt", (), {})
 sys.modules["omnivoice"] = fake_omnivoice
 
 import app
+import omni_model
 
 
 class FakeResponse:
@@ -620,6 +621,112 @@ class ConversationConstructionTests(unittest.TestCase):
                 {"role": "user", "content": "hello"},
             ],
         )
+
+
+class OmniAudioHandoffTests(unittest.TestCase):
+    def test_qwen_adapter_passes_conversation_audio_to_processor(self):
+        calls: dict[str, object] = {}
+
+        class FakeInputs(dict):
+            def to(self, _device):
+                return self
+
+        class FakeProcessor:
+            def apply_chat_template(self, conversation, **_kwargs):
+                calls["conversation"] = conversation
+                return "prompt"
+
+            def __call__(self, **kwargs):
+                calls["processor_audio"] = kwargs["audio"]
+                return FakeInputs()
+
+            def batch_decode(self, _text_ids, **_kwargs):
+                return ["response"]
+
+        class FakeAudioOutput:
+            def reshape(self, *_shape):
+                return self
+
+            def detach(self):
+                return self
+
+            def float(self):
+                return self
+
+            def cpu(self):
+                return self
+
+            def numpy(self):
+                return [0.0]
+
+        class FakeModel:
+            device = "cpu"
+            dtype = "float32"
+
+            def generate(self, **_kwargs):
+                return object(), FakeAudioOutput()
+
+        class FakeInferenceMode:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        class FakeTorch:
+            @staticmethod
+            def inference_mode():
+                return FakeInferenceMode()
+
+        fake_utils = types.ModuleType("qwen_omni_utils")
+
+        def process_mm_info(conversation, **_kwargs):
+            calls["processed_conversation"] = conversation
+            return ["decoded-audio"], None, None
+
+        fake_utils.process_mm_info = process_mm_info
+
+        adapter = object.__new__(app.QwenOmniModel)
+        adapter.is_qwen3 = False
+        adapter.processor = FakeProcessor()
+        adapter.model = FakeModel()
+        adapter.torch = FakeTorch()
+
+        with tempfile.TemporaryDirectory() as directory:
+            audio_path = Path(directory) / "input.wav"
+            audio_path.write_bytes(b"wav")
+            messages = app.build_messages(
+                "system",
+                [],
+                str(audio_path),
+                "",
+            )
+
+            def write_output(path, *_args, **_kwargs):
+                Path(path).write_bytes(b"pcm")
+
+            with (
+                patch.dict(sys.modules, {"qwen_omni_utils": fake_utils}),
+                patch.object(
+                    omni_model.sf,
+                    "write",
+                    side_effect=write_output,
+                    create=True,
+                ),
+            ):
+                text, audio = adapter.generate(
+                    messages,
+                    "Chelsie",
+                    16,
+                    0.7,
+                    0.95,
+                )
+
+        self.assertEqual(text, "response")
+        self.assertEqual(audio, b"pcm")
+        conversation = calls["processed_conversation"]
+        self.assertEqual(conversation[-1]["content"][0]["audio"], str(audio_path))
+        self.assertEqual(calls["processor_audio"], ["decoded-audio"])
 
 
 if __name__ == "__main__":

@@ -171,7 +171,6 @@ const ChatPage = () => {
   const [completedAssistantMessageId, setCompletedAssistantMessageId] =
     useState<string | null>(null)
   const transcriptionAnimationRef = useRef<number | null>(null)
-  const capturedAudioRef = useRef(new Map<string, AudioCaptureEvent>())
   const isGenerating = status === 'submitted' || status === 'streaming'
 
   const handleSubmit = useCallback(
@@ -202,25 +201,8 @@ const ChatPage = () => {
       }
 
       if (isVoiceOnlyMode) {
-        const transcript = event.text.trim()
-        const capturedAudio = capturedAudioRef.current.get(event.sessionId)
-        capturedAudioRef.current.delete(event.sessionId)
-
-        if (isGenerating) {
-          setIsTranscribing(false)
-          return
-        }
-
-        if (transcript && capturedAudio) {
-          submitOmniAudio(
-            transcript,
-            capturedAudio.audio,
-            capturedAudio.sampleRate
-          )
-        } else if (transcript) {
-          submitMessage(transcript)
-        }
-
+        // Raw audio is submitted when VAD closes the segment. ASR is kept
+        // optional for speaker mode and must never gate or duplicate it.
         setIsTranscribing(false)
         return
       }
@@ -267,16 +249,16 @@ const ChatPage = () => {
     [
       finishTranscriptionDraft,
       isVoiceOnlyMode,
-      isGenerating,
-      submitOmniAudio,
-      submitMessage,
       updateTranscriptionDraft,
     ]
   )
 
-  const handleAudioFinal = useCallback((event: AudioCaptureEvent) => {
-    capturedAudioRef.current.set(event.sessionId, event)
-  }, [])
+  const handleAudioFinal = useCallback(
+    (event: AudioCaptureEvent) => {
+      submitOmniAudio('', event.audio, event.sampleRate)
+    },
+    [submitOmniAudio]
+  )
 
   const handleTranscriptionStart = useCallback(
     (sessionId: string) => {
