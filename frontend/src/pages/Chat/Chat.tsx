@@ -39,11 +39,13 @@ import {
 import { SpeechInput } from '@/components/ai-elements/speech-input'
 import type { TranscriptionEvent } from '@/components/ai-elements/speech-input'
 import { Suggestions } from '@/components/ai-elements/suggestion'
+import { SpeechLanguageToggle } from '@/components/speech-language-toggle'
 import { Spinner } from '@/components/ui/spinner'
 import { Slider } from '@/components/ui/slider'
 import { Switch } from '@/components/ui/switch'
 import { useSpeakerVad } from '@/hooks/use-speaker-vad'
 import { useSpeakerSession } from '@/hooks/use-speaker-session'
+import { usePreferencesStore } from '@/src/state/preferences'
 import {
   MessageSquareTextIcon,
   MicIcon,
@@ -228,6 +230,12 @@ const ChatPage = () => {
   )
   const interruptAssistantResponse = useChatStore(
     (state) => state.interruptAssistantResponse
+  )
+  const speechLanguage = usePreferencesStore(
+    (state) => state.generationParameters.speechLanguage
+  )
+  const setGenerationParameter = usePreferencesStore(
+    (state) => state.setGenerationParameter
   )
   const [isTranscribing, setIsTranscribing] = useState(false)
   const [isVoiceOnlyMode, setIsVoiceOnlyMode] = useState(false)
@@ -591,6 +599,13 @@ const ChatPage = () => {
                 onValueChange={setTtsVolume}
                 value={ttsVolume}
               />
+              <SpeechLanguageToggle
+                disabled={!speakerSession.canChangeLanguage}
+                language={speechLanguage}
+                onLanguageChange={(language) =>
+                  setGenerationParameter('speechLanguage', language)
+                }
+              />
               <SpeakerMicrophoneControl
                 disabled={!speakerSession.canCapture}
                 error={speakerVadError ?? speakerSession.error}
@@ -636,7 +651,10 @@ const ChatPage = () => {
                   />
                   <SpeechInput
                     className="shrink-0"
-                    defaultLanguage="en"
+                    language={speechLanguage}
+                    onLanguageChange={(language) =>
+                      setGenerationParameter('speechLanguage', language)
+                    }
                     onTranscriptionChange={handleTranscriptionChange}
                     onTranscriptionProcessingChange={
                       handleTranscriptionProcessingChange

@@ -26,6 +26,7 @@ export type SpeakerServerEvent = {
   reason?: string
   encoding?: 'pcm_s16le'
   sampleRate?: number
+  inputLanguage?: 'en' | 'sv'
 }
 
 export const createSpeakerEvent = (

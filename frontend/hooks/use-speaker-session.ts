@@ -17,6 +17,7 @@ import {
   omnivoiceNumStepsFromLevel,
   usePreferencesStore,
 } from '@/src/state/preferences'
+import type { SpeechLanguage } from '@/src/lib/speech-language'
 
 const apiEndpoint =
   import.meta.env.VITE_API_ENDPOINT ?? 'http://127.0.0.1:8000'
@@ -36,6 +37,19 @@ export const useSpeakerSession = ({
   const generationParameters = usePreferencesStore(
     (state) => state.generationParameters
   )
+  const setGenerationParameter = usePreferencesStore(
+    (state) => state.setGenerationParameter
+  )
+  const speechLanguage = generationParameters.speechLanguage
+  const generationConfigurationKey = JSON.stringify({
+    cloneVoice: generationParameters.cloneVoice,
+    maxNewTokens: generationParameters.maxNewTokens,
+    model: generationParameters.model,
+    repeatPenalty: generationParameters.repeatPenalty,
+    seed: generationParameters.seed,
+    temperature: generationParameters.temperature,
+    ttsStepLevel: generationParameters.ttsStepLevel,
+  })
   const activeChatKey = useChatStore((state) => state.activeChatKey)
   const commitUser = useChatStore(
     (state) => state.commitSpeakerUserMessage
@@ -47,6 +61,7 @@ export const useSpeakerSession = ({
   const [error, setError] = useState<string | null>(null)
   const [isReady, setIsReady] = useState(false)
   const [isPlaying, setIsPlaying] = useState(false)
+  const [isLanguageUpdating, setIsLanguageUpdating] = useState(false)
   const [audioLevel, setAudioLevel] = useState(0)
   const [latestUserTranscript, setLatestUserTranscript] = useState<string | null>(
     null
@@ -56,6 +71,7 @@ export const useSpeakerSession = ({
   >(null)
 
   const socketRef = useRef<WebSocket | null>(null)
+  const sessionReadyRef = useRef(false)
   const phaseRef = useRef<PipelinePhase>('idle')
   const turnIdRef = useRef<string | null>(null)
   const turnRevisionRef = useRef(0)
@@ -65,11 +81,51 @@ export const useSpeakerSession = ({
   const playedTextRef = useRef(new Map<number, string[]>())
   const committedGenerationsRef = useRef(new Set<number>())
   const sessionChatKeyRef = useRef(activeChatKey)
+  const desiredLanguageRef = useRef<SpeechLanguage>(speechLanguage)
+  const acknowledgedLanguageRef = useRef<SpeechLanguage>(speechLanguage)
+  const pendingLanguageRef = useRef<SpeechLanguage | null>(null)
+  const languageUpdatingRef = useRef(false)
+  const generationParametersRef = useRef(generationParameters)
   const sendEventRef = useRef<(type: string, values?: Record<string, unknown>) => void>(
     () => undefined
   )
   const commitAssistantRef = useRef(commitAssistant)
   commitAssistantRef.current = commitAssistant
+  desiredLanguageRef.current = speechLanguage
+  generationParametersRef.current = generationParameters
+
+  const requestLanguageUpdateRef = useRef<() => void>(() => undefined)
+  const requestLanguageUpdate = useCallback(() => {
+    const desiredLanguage = desiredLanguageRef.current
+    if (
+      !sessionReadyRef.current ||
+      phaseRef.current !== 'idle' ||
+      pendingLanguageRef.current !== null ||
+      desiredLanguage === acknowledgedLanguageRef.current
+    ) {
+      return
+    }
+    const socket = socketRef.current
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      return
+    }
+    pendingLanguageRef.current = desiredLanguage
+    languageUpdatingRef.current = true
+    setIsLanguageUpdating(true)
+    sendEventRef.current('session.update', {
+      inputLanguage: desiredLanguage,
+    })
+    console.debug('[speaker-session] language update requested', {
+      inputLanguage: desiredLanguage,
+    })
+  }, [])
+  requestLanguageUpdateRef.current = requestLanguageUpdate
+
+  useEffect(() => {
+    if (enabled) {
+      requestLanguageUpdate()
+    }
+  }, [enabled, requestLanguageUpdate, speechLanguage])
 
   const playerRef = useRef<SpeakerPcmPlayback | null>(null)
   if (!playerRef.current && typeof window !== 'undefined') {
@@ -138,6 +194,10 @@ export const useSpeakerSession = ({
       setIsReady(false)
       setError(null)
       phaseRef.current = 'idle'
+      sessionReadyRef.current = false
+      pendingLanguageRef.current = null
+      languageUpdatingRef.current = false
+      setIsLanguageUpdating(false)
       turnIdRef.current = null
       generationRef.current = null
       playerRef.current?.clear()
@@ -192,6 +252,7 @@ export const useSpeakerSession = ({
       }
       console.debug('[speaker-session] server event', {
         generation: serverEvent.responseGeneration,
+        inputLanguage: serverEvent.inputLanguage,
         revision: serverEvent.turnRevision,
         segmentId: serverEvent.segmentId,
         turnId: serverEvent.turnId,
@@ -202,8 +263,40 @@ export const useSpeakerSession = ({
           reconnectAttempts = 0
           setError(null)
           setIsReady(true)
+          sessionReadyRef.current = true
+          acknowledgedLanguageRef.current =
+            serverEvent.inputLanguage ?? desiredLanguageRef.current
+          pendingLanguageRef.current = null
+          languageUpdatingRef.current = false
+          setIsLanguageUpdating(false)
           setStatus('listening')
           phaseRef.current = 'idle'
+          queueMicrotask(() => requestLanguageUpdateRef.current())
+          return
+        case 'session.updated':
+          if (
+            serverEvent.inputLanguage !== 'en' &&
+            serverEvent.inputLanguage !== 'sv'
+          ) {
+            pendingLanguageRef.current = null
+            languageUpdatingRef.current = false
+            setIsLanguageUpdating(false)
+            setGenerationParameter(
+              'speechLanguage',
+              acknowledgedLanguageRef.current
+            )
+            setError('The speaker server returned an invalid language update.')
+            return
+          }
+          acknowledgedLanguageRef.current = serverEvent.inputLanguage
+          pendingLanguageRef.current = null
+          languageUpdatingRef.current = false
+          setIsLanguageUpdating(false)
+          setError(null)
+          console.debug('[speaker-session] language update acknowledged', {
+            inputLanguage: serverEvent.inputLanguage,
+          })
+          queueMicrotask(() => requestLanguageUpdateRef.current())
           return
         case 'input.transcription.committed':
           if (serverEvent.text) {
@@ -217,6 +310,7 @@ export const useSpeakerSession = ({
           phaseRef.current = 'idle'
           generationRef.current = null
           setStatus('listening')
+          queueMicrotask(() => requestLanguageUpdateRef.current())
           return
         case 'response.started':
           if (typeof serverEvent.responseGeneration === 'number') {
@@ -275,6 +369,7 @@ export const useSpeakerSession = ({
           phaseRef.current = 'idle'
           generationRef.current = null
           setStatus('listening')
+          queueMicrotask(() => requestLanguageUpdateRef.current())
           return
         case 'response.cancelled':
           if (typeof serverEvent.responseGeneration !== 'number') {
@@ -311,9 +406,22 @@ export const useSpeakerSession = ({
             phaseRef.current = 'idle'
             generationRef.current = null
             setStatus('listening')
+            queueMicrotask(() => requestLanguageUpdateRef.current())
           }
           return
         case 'error':
+          if (pendingLanguageRef.current !== null) {
+            const acknowledgedLanguage = acknowledgedLanguageRef.current
+            pendingLanguageRef.current = null
+            languageUpdatingRef.current = false
+            setIsLanguageUpdating(false)
+            setGenerationParameter('speechLanguage', acknowledgedLanguage)
+            setError(
+              serverEvent.message ?? 'Could not change speaker input language.'
+            )
+            setStatus('listening')
+            return
+          }
           setError(serverEvent.message ?? 'Speaker mode encountered an error.')
           setStatus('error')
           if (serverEvent.fatal) {
@@ -336,6 +444,7 @@ export const useSpeakerSession = ({
       generationRef.current = null
       binaryGenerationRef.current = null
       setStatus(reconnectAttempts ? 'reconnecting' : 'connecting')
+      sessionReadyRef.current = false
       const socket = new WebSocket(
         getSpeakerSocketUrl(apiEndpoint),
         speakerWebSocketProtocol
@@ -346,6 +455,7 @@ export const useSpeakerSession = ({
       socket.addEventListener('open', () => {
         console.debug('[speaker-session] socket opened', { activeChatKey })
         const history = useChatStore.getState().getConversationHistory()
+        const currentGenerationParameters = generationParametersRef.current
         socket.send(
           JSON.stringify(
             createSpeakerEvent('session.configure', {
@@ -354,16 +464,17 @@ export const useSpeakerSession = ({
               personaName: persona.name,
               instructionPrompt: persona.instructionPrompt,
               history,
+              inputLanguage: desiredLanguageRef.current,
               generation: {
-                model: generationParameters.model,
-                temperature: generationParameters.temperature,
-                repeatPenalty: generationParameters.repeatPenalty,
-                seed: generationParameters.seed,
-                maxTokens: generationParameters.maxNewTokens,
-                cloneVoice: generationParameters.cloneVoice,
+                model: currentGenerationParameters.model,
+                temperature: currentGenerationParameters.temperature,
+                repeatPenalty: currentGenerationParameters.repeatPenalty,
+                seed: currentGenerationParameters.seed,
+                maxTokens: currentGenerationParameters.maxNewTokens,
+                cloneVoice: currentGenerationParameters.cloneVoice,
                 refAudio: persona.audioSampleUrl ?? null,
                 numStep: omnivoiceNumStepsFromLevel(
-                  generationParameters.ttsStepLevel
+                  currentGenerationParameters.ttsStepLevel
                 ),
                 speed: 0.8,
               },
@@ -422,6 +533,16 @@ export const useSpeakerSession = ({
           socketRef.current = null
         }
         setIsReady(false)
+        sessionReadyRef.current = false
+        if (pendingLanguageRef.current !== null) {
+          setGenerationParameter(
+            'speechLanguage',
+            acknowledgedLanguageRef.current
+          )
+        }
+        pendingLanguageRef.current = null
+        languageUpdatingRef.current = false
+        setIsLanguageUpdating(false)
         playerRef.current?.clear()
         commitInterruptedLocally(generationRef.current)
         commitInterruptedLocally(pendingInterruptedGenerationRef.current)
@@ -463,8 +584,9 @@ export const useSpeakerSession = ({
     commitInterruptedLocally,
     commitUser,
     enabled,
-    generationParameters,
+    generationConfigurationKey,
     persona,
+    setGenerationParameter,
   ])
 
   const onAudioEvent = useCallback<SpeakerAudioConsumer>((audioEvent) => {
@@ -480,6 +602,13 @@ export const useSpeakerSession = ({
         probabilityMax: audioEvent.probabilityMax,
         probabilityMin: audioEvent.probabilityMin,
         sampleCount: audioEvent.sampleCount,
+      })
+      return
+    }
+
+    if (languageUpdatingRef.current) {
+      console.debug('[speaker-session] dropped microphone event during language update', {
+        type: audioEvent.type,
       })
       return
     }
@@ -590,9 +719,15 @@ export const useSpeakerSession = ({
   return {
     audioLevel,
     canCapture:
-      enabled && isReady && sessionChatKeyRef.current === activeChatKey,
+      enabled &&
+      isReady &&
+      !isLanguageUpdating &&
+      sessionChatKeyRef.current === activeChatKey,
+    canChangeLanguage:
+      enabled && isReady && !isLanguageUpdating && status === 'listening',
     error,
     isPlaying,
+    isLanguageUpdating,
     latestAssistantTranscript:
       sessionChatKeyRef.current === activeChatKey
         ? latestAssistantTranscript

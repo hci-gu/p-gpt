@@ -85,15 +85,31 @@ async def lifespan(app: FastAPI):
         perf_counter() - default_voice_start,
     )
 
-    from speaker.asr import ParakeetASR
+    from speaker.asr import KBWhisperASR, ParakeetASR, SpeakerASRRouter
 
-    logger.info("Loading speaker ASR model %s", settings.speaker_asr_model)
+    logger.info(
+        "Loading English speaker ASR model %s",
+        settings.speaker_asr_model,
+    )
     speaker_asr_start = perf_counter()
-    speaker_asr = await asyncio.to_thread(
+    parakeet_asr = await asyncio.to_thread(
         ParakeetASR.from_pretrained,
         settings.speaker_asr_model,
     )
-    app.state.speaker_asr = speaker_asr
+    logger.info(
+        "Loading Swedish speaker ASR model %s revision=%s",
+        settings.speaker_asr_model_sv,
+        settings.speaker_asr_revision_sv,
+    )
+    kb_whisper_asr = await asyncio.to_thread(
+        KBWhisperASR.from_pretrained,
+        settings.speaker_asr_model_sv,
+        settings.speaker_asr_revision_sv,
+    )
+    speaker_asr_router = SpeakerASRRouter(
+        routes={"en": parakeet_asr, "sv": kb_whisper_asr}
+    )
+    app.state.speaker_asr_router = speaker_asr_router
     app.state.speaker_asr_lock = asyncio.Lock()
     warmup_audio, warmup_sample_rate = await asyncio.to_thread(
         sf.read,
@@ -101,15 +117,38 @@ async def lifespan(app: FastAPI):
         dtype="float32",
         always_2d=True,
     )
-    warmup_transcript = await asyncio.to_thread(
-        speaker_asr.transcribe_waveform,
-        warmup_audio,
-        warmup_sample_rate,
-    )
-    if not warmup_transcript:
-        logger.warning("Speaker ASR warmup completed with an empty transcript.")
+    for language, adapter in speaker_asr_router.routes.items():
+        warmup_start = perf_counter()
+        warmup_transcript = await asyncio.to_thread(
+            adapter.transcribe_waveform,
+            warmup_audio,
+            warmup_sample_rate,
+        )
+        if not warmup_transcript:
+            logger.warning(
+                "Speaker ASR warmup completed with an empty transcript: language=%s model=%s",
+                language,
+                adapter.model_id,
+            )
+        logger.info(
+            "Speaker ASR route online: language=%s model=%s device=%s dtype=%s warmup_seconds=%.3f",
+            language,
+            adapter.model_id,
+            adapter.device,
+            getattr(adapter, "dtype", "runtime-managed"),
+            perf_counter() - warmup_start,
+        )
+    if torch.cuda.is_available():
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        logger.info(
+            "Speaker ASR CUDA memory after warmup: allocated_mib=%.1f reserved_mib=%.1f free_mib=%.1f total_mib=%.1f",
+            torch.cuda.memory_allocated() / (1024 * 1024),
+            torch.cuda.memory_reserved() / (1024 * 1024),
+            free_bytes / (1024 * 1024),
+            total_bytes / (1024 * 1024),
+        )
     logger.info(
-        "Speaker ASR is online; load and warmup took %.3fs",
+        "All speaker ASR routes are online; load and warmup took %.3fs",
         perf_counter() - speaker_asr_start,
     )
 
@@ -129,8 +168,8 @@ async def lifespan(app: FastAPI):
             await asyncio.gather(*prompt_tasks, return_exceptions=True)
         app.state.voice_clone_prompts.clear()
         app.state.voice_clone_prompt_tasks.clear()
-        app.state.speaker_asr.close()
-        del app.state.speaker_asr
+        app.state.speaker_asr_router.close()
+        del app.state.speaker_asr_router
         del app.state.speaker_asr_lock
         del app.state.default_voice_clone_prompt
         del app.state.tts_model
@@ -1930,14 +1969,38 @@ async def _configure_speaker_session(event: Any) -> Any:
     )
 
 
-async def _transcribe_speaker_audio(audio: bytes) -> str:
+async def _transcribe_speaker_audio(
+    audio: bytes,
+    language: Literal["en", "sv"],
+) -> str:
+    queue_start = perf_counter()
     inference_task: asyncio.Task[str] | None = None
     async with app.state.speaker_asr_lock:
+        queue_seconds = perf_counter() - queue_start
+        adapter = app.state.speaker_asr_router.adapter_for(language)
+        inference_start = perf_counter()
+        logger.info(
+            "Speaker ASR inference acquired: input_language=%s model=%s audio_seconds=%.3f queue_seconds=%.3f device=%s dtype=%s",
+            language,
+            adapter.model_id,
+            len(audio) / (16_000 * 2),
+            queue_seconds,
+            adapter.device,
+            getattr(adapter, "dtype", "runtime-managed"),
+        )
         inference_task = asyncio.create_task(
-            asyncio.to_thread(app.state.speaker_asr.transcribe_pcm16, audio)
+            asyncio.to_thread(adapter.transcribe_pcm16, audio)
         )
         try:
-            return await asyncio.shield(inference_task)
+            transcript = await asyncio.shield(inference_task)
+            logger.info(
+                "Speaker ASR inference finished: input_language=%s model=%s inference_seconds=%.3f chars=%s",
+                language,
+                adapter.model_id,
+                perf_counter() - inference_start,
+                len(transcript),
+            )
+            return transcript
         except asyncio.CancelledError:
             await inference_task
             raise

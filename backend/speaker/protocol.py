@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
-from typing import Annotated, Literal
+from typing import Annotated, Literal, TypeAlias
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
+
+
+SpeakerInputLanguage: TypeAlias = Literal["en", "sv"]
 
 
 def _to_camel(value: str) -> str:
@@ -58,6 +61,12 @@ class SessionConfigureEvent(ClientEvent):
     generation: SpeakerGenerationSettings
     input_audio: AudioFormat
     output_audio: AudioFormat
+    input_language: SpeakerInputLanguage = "en"
+
+
+class SessionUpdateEvent(ClientEvent):
+    type: Literal["session.update"]
+    input_language: SpeakerInputLanguage
 
 
 class TurnEvent(ClientEvent):
@@ -127,6 +136,7 @@ class VadDiagnosticEvent(ClientEvent):
 
 SpeakerClientEvent = Annotated[
     SessionConfigureEvent
+    | SessionUpdateEvent
     | SpeechCandidateEvent
     | SpeechCandidateCancelledEvent
     | SpeechStartedEvent

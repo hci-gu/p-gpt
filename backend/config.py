@@ -10,6 +10,8 @@ class Settings(BaseSettings):
     ollama_text_model: str = "gemma4:e4b"
     tts_model: str = "k2-fsa/OmniVoice"
     speaker_asr_model: str = "nvidia/parakeet-tdt-0.6b-v3"
+    speaker_asr_model_sv: str = "KBLab/kb-whisper-medium"
+    speaker_asr_revision_sv: str = "standard"
     speaker_reopen_grace_seconds: float = Field(default=1.5, ge=0.25, le=5)
     vllm_tts_model: str = "mistralai/Voxtral-4B-TTS-2603"
     pocketbase_base_url: str = "http://127.0.0.1:8090"

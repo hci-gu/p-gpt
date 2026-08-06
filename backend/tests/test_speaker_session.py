@@ -11,7 +11,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from speaker.protocol import parse_client_event
-from speaker.asr import ParakeetASR
+from speaker.asr import KBWhisperASR, ParakeetASR, SpeakerASRRouter
 from speaker.session import (
     SentenceSegmenter,
     SpeakerConfiguredContext,
@@ -26,7 +26,8 @@ def event(event_type: str, **values):
     )
 
 
-def configuration():
+def configuration(input_language=None):
+    language = {} if input_language is None else {"inputLanguage": input_language}
     return event(
         "session.configure",
         protocolVersion=1,
@@ -53,6 +54,7 @@ def configuration():
             "sampleRate": 24_000,
             "channels": 1,
         },
+        **language,
     )
 
 
@@ -74,14 +76,20 @@ class FakeApplication:
     pass
 
 
-def services(transcript="Hello", response="A first sentence. A second sentence."):
+def services(
+    transcript="Hello",
+    response="A first sentence. A second sentence.",
+    transcribed_languages=None,
+):
     async def configure(_event):
         return SpeakerConfiguredContext(
             application=FakeApplication(),
             history=[{"role": "system", "content": "trusted"}],
         )
 
-    async def transcribe(_audio):
+    async def transcribe(_audio, language):
+        if transcribed_languages is not None:
+            transcribed_languages.append(language)
         return transcript
 
     async def stream_text(_context, _history):
@@ -156,6 +164,72 @@ class ParakeetAdapterTests(unittest.TestCase):
         np.testing.assert_allclose(model.audio, [-1, 0, 32_767 / 32_768])
 
 
+class KBWhisperAdapterTests(unittest.TestCase):
+    def test_pcm16_uses_swedish_chunked_transcription(self):
+        calls = []
+
+        def transcriber(audio, **options):
+            calls.append((audio, options))
+            return {"text": " hej världen "}
+
+        adapter = KBWhisperASR(
+            model=object(),
+            processor=object(),
+            transcriber=transcriber,
+            device="cpu",
+            dtype="float32",
+            model_id="KBLab/kb-whisper-medium",
+            revision="standard",
+        )
+        audio = np.asarray([-32_768, 0, 32_767], dtype="<i2").tobytes()
+
+        self.assertEqual(adapter.transcribe_pcm16(audio), "hej världen")
+        payload, options = calls[0]
+        np.testing.assert_allclose(
+            payload["raw"], [-1, 0, 32_767 / 32_768]
+        )
+        self.assertEqual(payload["sampling_rate"], 16_000)
+        self.assertEqual(options["chunk_length_s"], 30)
+        self.assertEqual(options["stride_length_s"], 5)
+        self.assertEqual(
+            options["generate_kwargs"],
+            {"task": "transcribe", "language": "sv"},
+        )
+
+    def test_invalid_pipeline_result_is_rejected(self):
+        adapter = KBWhisperASR(
+            model=object(),
+            processor=object(),
+            transcriber=lambda *_args, **_kwargs: {},
+            device="cpu",
+            dtype="float32",
+            model_id="KBLab/kb-whisper-medium",
+            revision="standard",
+        )
+
+        with self.assertRaises(RuntimeError):
+            adapter.transcribe_pcm16(bytes(2))
+
+    def test_router_uses_selected_language(self):
+        class FakeAdapter:
+            def __init__(self, name):
+                self.model_id = name
+                self.device = "cpu"
+
+            def transcribe_pcm16(self, _audio):
+                return self.model_id
+
+            def close(self):
+                pass
+
+        router = SpeakerASRRouter(
+            routes={"en": FakeAdapter("parakeet"), "sv": FakeAdapter("whisper")}
+        )
+
+        self.assertEqual(router.transcribe_pcm16(bytes(2), "en"), "parakeet")
+        self.assertEqual(router.transcribe_pcm16(bytes(2), "sv"), "whisper")
+
+
 class SpeakerSessionTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.websocket = FakeWebSocket()
@@ -165,6 +239,84 @@ class SpeakerSessionTests(unittest.IsolatedAsyncioTestCase):
             logging.getLogger("speaker-test"),
         )
         await self.session._configure(configuration())
+
+    async def test_configuration_defaults_to_english(self):
+        self.assertEqual(self.session.input_language, "en")
+        ready = [
+            value
+            for kind, value in self.websocket.sent
+            if kind == "json" and value["type"] == "session.ready"
+        ][-1]
+        self.assertEqual(ready["inputLanguage"], "en")
+
+    async def test_language_can_be_updated_while_idle(self):
+        await self.session._update_session(
+            event("session.update", inputLanguage="sv")
+        )
+
+        self.assertEqual(self.session.input_language, "sv")
+        updated = [
+            value
+            for kind, value in self.websocket.sent
+            if kind == "json" and value["type"] == "session.updated"
+        ][-1]
+        self.assertEqual(updated["inputLanguage"], "sv")
+
+    async def test_language_update_is_rejected_during_active_turn(self):
+        await self.session._speech_started(
+            event(
+                "input.speech_started",
+                turnId="turn-1",
+                turnRevision=0,
+                reopened=False,
+            )
+        )
+        await self.session._update_session(
+            event("session.update", inputLanguage="sv")
+        )
+
+        self.assertEqual(self.session.input_language, "en")
+        self.assertEqual(self.session.turn_language, "en")
+        errors = [
+            value
+            for kind, value in self.websocket.sent
+            if kind == "json" and value["type"] == "error"
+        ]
+        self.assertEqual(errors[-1]["code"], "session_busy")
+
+    async def test_selected_language_is_passed_to_transcription(self):
+        languages = []
+        websocket = FakeWebSocket()
+        session = SpeakerSession(
+            websocket,
+            services(transcribed_languages=languages),
+            logging.getLogger("speaker-language-test"),
+            reopen_grace_seconds=60,
+        )
+        await session._configure(configuration("sv"))
+        await session._speech_started(
+            event(
+                "input.speech_started",
+                turnId="turn-sv",
+                turnRevision=0,
+                reopened=False,
+            )
+        )
+        await session._handle_audio(bytes(1_024))
+        await session._speech_soft_ended(
+            event(
+                "input.speech_soft_ended",
+                turnId="turn-sv",
+                turnRevision=0,
+            )
+        )
+        for _ in range(20):
+            await asyncio.sleep(0)
+            if languages:
+                break
+        session._invalidate_pipeline()
+
+        self.assertEqual(languages, ["sv"])
 
     async def test_audio_is_rejected_outside_capture(self):
         await self.session._handle_audio(bytes(1_024))
@@ -263,6 +415,7 @@ class SpeakerSessionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(self.session.state, "capturing")
         self.assertEqual(self.session.turn_revision, 1)
+        self.assertEqual(self.session.turn_language, "en")
         self.assertEqual(len(self.session.audio), 1_024)
         self.assertEqual(previous_generation, 1)
         self.assertIsNone(self.session.pipeline_task)

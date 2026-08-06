@@ -1,7 +1,8 @@
 import { pipeline } from '@huggingface/transformers'
 import { asrModelIds, defaultAsrModel, type AsrModel } from '@/src/lib/asr-models'
+import type { SpeechLanguage } from '@/src/lib/speech-language'
 
-export type SpeechLanguage = 'en' | 'sv'
+export type { SpeechLanguage } from '@/src/lib/speech-language'
 
 export type AsrWorkerRequest =
   | {

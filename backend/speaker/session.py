@@ -17,7 +17,9 @@ from .protocol import (
     PlaybackSegmentCompletedEvent,
     ResponseCancelEvent,
     SessionConfigureEvent,
+    SessionUpdateEvent,
     SpeakerClientEvent,
+    SpeakerInputLanguage,
     SpeechCandidateCancelledEvent,
     SpeechCandidateEvent,
     SpeechSoftEndedEvent,
@@ -41,7 +43,7 @@ class SpeakerConfiguredContext:
 @dataclass
 class SpeakerServices:
     configure: Callable[[SessionConfigureEvent], Awaitable[SpeakerConfiguredContext]]
-    transcribe: Callable[[bytes], Awaitable[str]]
+    transcribe: Callable[[bytes, SpeakerInputLanguage], Awaitable[str]]
     stream_text: Callable[
         [Any, list[dict[str, str]]],
         AsyncIterator[str],
@@ -137,6 +139,8 @@ class SpeakerSession:
             "awaiting_config", "idle", "capturing", "grace", "responding", "closed"
         ] = "awaiting_config"
         self.context: SpeakerConfiguredContext | None = None
+        self.input_language: SpeakerInputLanguage = "en"
+        self.turn_language: SpeakerInputLanguage | None = None
         self.turn_id: str | None = None
         self.turn_revision = 0
         self.audio = bytearray()
@@ -203,6 +207,8 @@ class SpeakerSession:
             await self._configure(event)
         elif self.state == "awaiting_config":
             await self._send_error("session_not_configured", "Configure the session first.")
+        elif isinstance(event, SessionUpdateEvent):
+            await self._update_session(event)
         elif isinstance(event, SpeechCandidateEvent):
             await self._speech_candidate(event)
         elif isinstance(event, SpeechCandidateCancelledEvent):
@@ -257,16 +263,39 @@ class SpeakerSession:
             self.state = "closed"
             return
         self.state = "idle"
+        self.input_language = event.input_language
         self.logger.info(
-            "Speaker session ready: session=%s history_messages=%s grace_seconds=%.3f",
+            "Speaker session ready: session=%s history_messages=%s grace_seconds=%.3f input_language=%s",
             self.session_id,
             len(self.context.history),
             self.reopen_grace_seconds,
+            self.input_language,
         )
         await self._send_json(
             "session.ready",
+            inputLanguage=self.input_language,
             inputAudio={"encoding": "pcm_s16le", "sampleRate": 16_000, "channels": 1, "frameSamples": 512},
             outputAudio={"encoding": "pcm_s16le", "sampleRate": 24_000, "channels": 1},
+        )
+
+    async def _update_session(self, event: SessionUpdateEvent) -> None:
+        if self.state != "idle":
+            await self._send_error(
+                "session_busy",
+                "The input language can only be changed between turns.",
+            )
+            return
+        previous_language = self.input_language
+        self.input_language = event.input_language
+        self.logger.info(
+            "Speaker input language updated: session=%s previous_language=%s input_language=%s",
+            self.session_id,
+            previous_language,
+            self.input_language,
+        )
+        await self._send_json(
+            "session.updated",
+            inputLanguage=self.input_language,
         )
 
     async def _handle_audio(self, audio: bytes) -> None:
@@ -371,6 +400,7 @@ class SpeakerSession:
 
         self.turn_id = event.turn_id
         self.turn_revision = event.turn_revision
+        self.turn_language = self.input_language
         self.audio = bytearray()
         self.received_audio_frames = 0
         self.state = "capturing"
@@ -406,17 +436,19 @@ class SpeakerSession:
         snapshot = bytes(self.audio)
         turn_id = self.turn_id
         revision = self.turn_revision
+        language = self.turn_language or self.input_language
         self.logger.info(
-            "Speaker soft-end: session=%s turn=%s revision=%s generation=%s bytes=%s grace_seconds=%.3f",
+            "Speaker soft-end: session=%s turn=%s revision=%s generation=%s bytes=%s grace_seconds=%.3f input_language=%s",
             self.session_id,
             turn_id,
             revision,
             generation,
             len(snapshot),
             self.reopen_grace_seconds,
+            language,
         )
         self.pipeline_task = asyncio.create_task(
-            self._run_pipeline(turn_id, revision, generation, snapshot)
+            self._run_pipeline(turn_id, revision, generation, snapshot, language)
         )
 
     async def _run_pipeline(
@@ -425,26 +457,29 @@ class SpeakerSession:
         revision: int,
         generation: int,
         audio: bytes,
+        language: SpeakerInputLanguage,
     ) -> None:
         text_task: asyncio.Task[None] | None = None
         stage_start = perf_counter()
         try:
             self.logger.info(
-                "Speaker ASR start: session=%s turn=%s revision=%s generation=%s audio_seconds=%.3f",
+                "Speaker ASR start: session=%s turn=%s revision=%s generation=%s input_language=%s audio_seconds=%.3f",
                 self.session_id,
                 turn_id,
                 revision,
                 generation,
+                language,
                 len(audio) / (16_000 * 2),
             )
-            transcript = (await self.services.transcribe(audio)).strip()
+            transcript = (await self.services.transcribe(audio, language)).strip()
             self._require_current(turn_id, revision, generation)
             self.logger.info(
-                "Speaker ASR complete: session=%s turn=%s revision=%s generation=%s elapsed=%.3fs chars=%s",
+                "Speaker ASR complete: session=%s turn=%s revision=%s generation=%s input_language=%s elapsed=%.3fs chars=%s",
                 self.session_id,
                 turn_id,
                 revision,
                 generation,
+                language,
                 perf_counter() - stage_start,
                 len(transcript),
             )
