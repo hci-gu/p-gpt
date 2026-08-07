@@ -1,5 +1,9 @@
 import { backgroundOptions, defaultBackgroundId } from '@/lib/backgrounds'
 import { asrModels, defaultAsrModel, type AsrModel } from '@/src/lib/asr-models'
+import {
+  isSpeechLanguage,
+  type SpeechLanguage,
+} from '@/src/lib/speech-language'
 import { create } from 'zustand'
 
 const backgroundStorageKey = 'p-gpt-background'
@@ -18,6 +22,7 @@ export type GenerationParameters = {
   ttsStepLevel: number
   repeatPenalty: 1 | 1.1 | 1.2
   seed: number | null
+  speechLanguage: SpeechLanguage
 }
 
 export const omnivoiceNumStepsFromLevel = (level: number) =>
@@ -33,6 +38,7 @@ export const defaultGenerationParameters: GenerationParameters = {
   ttsStepLevel: 5,
   repeatPenalty: 1,
   seed: null,
+  speechLanguage: 'en',
 }
 
 const getInitialBackgroundId = () => {
@@ -109,6 +115,10 @@ const getInitialGenerationParameters = (): GenerationParameters => {
       parsed.seed >= 0
         ? parsed.seed
         : defaultGenerationParameters.seed
+    const speechLanguage =
+      'speechLanguage' in parsed && isSpeechLanguage(parsed.speechLanguage)
+        ? parsed.speechLanguage
+        : defaultGenerationParameters.speechLanguage
 
     return {
       asrModel,
@@ -117,6 +127,7 @@ const getInitialGenerationParameters = (): GenerationParameters => {
       model,
       repeatPenalty,
       seed,
+      speechLanguage,
       streaming,
       temperature,
       ttsStepLevel,

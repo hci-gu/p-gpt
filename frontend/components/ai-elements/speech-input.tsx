@@ -2,15 +2,16 @@
 
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
+import { SpeechLanguageToggle } from "@/components/speech-language-toggle";
 import { cn } from "@/lib/utils";
+import type { SpeechLanguage } from "@/src/lib/speech-language";
 import { usePreferencesStore } from "@/src/state/preferences";
-import { LanguagesIcon, MicIcon, SquareIcon } from "lucide-react";
+import { MicIcon, SquareIcon } from "lucide-react";
 import type { ComponentProps } from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type {
   AsrWorkerRequest,
   AsrWorkerResponse,
-  SpeechLanguage,
 } from "../../src/workers/asr-worker";
 
 type BrowserWindow = Window &
@@ -36,7 +37,8 @@ export type SpeechInputProps = Omit<
   ComponentProps<typeof Button>,
   "onError"
 > & {
-  defaultLanguage?: SpeechLanguage;
+  language: SpeechLanguage;
+  onLanguageChange: (language: SpeechLanguage) => void;
   onTranscriptionChange?: (event: TranscriptionEvent) => void;
   onTranscriptionError?: (error: string) => void;
   onTranscriptionProcessingChange?: (isProcessing: boolean) => void;
@@ -110,8 +112,9 @@ const resampleToTargetRate = (
 
 export const SpeechInput = ({
   className,
-  defaultLanguage = "en",
   disabled,
+  language,
+  onLanguageChange,
   onTranscriptionChange,
   onTranscriptionError,
   onTranscriptionProcessingChange,
@@ -119,7 +122,6 @@ export const SpeechInput = ({
   showMicrophone = true,
   ...props
 }: SpeechInputProps) => {
-  const [language, setLanguage] = useState<SpeechLanguage>(defaultLanguage);
   const asrModel = usePreferencesStore(
     (state) => state.generationParameters.asrModel
   );
@@ -376,13 +378,9 @@ export const SpeechInput = ({
     void startRecording();
   }, [startRecording, status, stopRecording]);
 
-  const toggleLanguage = useCallback(() => {
-    setLanguage((currentLanguage) => {
-      const nextLanguage = currentLanguage === "en" ? "sv" : "en";
-      postWorkerMessage({ language: nextLanguage, type: "setLanguage" });
-      return nextLanguage;
-    });
-  }, [postWorkerMessage]);
+  useEffect(() => {
+    postWorkerMessage({ language, type: "setLanguage" });
+  }, [language, postWorkerMessage]);
 
   useEffect(
     () => () => {
@@ -400,19 +398,11 @@ export const SpeechInput = ({
 
   return (
     <div className="inline-flex items-center gap-0.5">
-      <Button
-        aria-label={`Switch transcription language, currently ${
-          language === "en" ? "English" : "Swedish"
-        }`}
-        className="h-8 gap-1 border border-border/25 bg-accent/10 px-2 text-xs uppercase shadow-[0_1px_2px_hsl(0_0%_0%/0.04)] hover:bg-accent"
+      <SpeechLanguageToggle
         disabled={disabled || isRecording || isLoading || !isSupported}
-        onClick={toggleLanguage}
-        type="button"
-        variant="ghost"
-      >
-        <LanguagesIcon className="size-3.5" />
-        {language}
-      </Button>
+        language={language}
+        onLanguageChange={onLanguageChange}
+      />
       {showMicrophone && (
         <div className="relative inline-flex items-center justify-center">
           {isRecording &&

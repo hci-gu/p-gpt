@@ -1,6 +1,7 @@
 import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 import hashlib
 from io import BytesIO
 import mlflow
@@ -16,20 +17,34 @@ from typing import Any, Literal
 from urllib.parse import urlparse
 from uuid import uuid4
 from config import settings
+from logging_config import configure_persistent_logging
 
 import httpx
 import soundfile as sf
 import torch
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from omnivoice import OmniVoice, VoiceClonePrompt
 from pydantic import BaseModel, Field, ValidationError, field_validator
+from speaker.tts_metrics import calculate_speaker_tts_timing
 
 # FastAPI's development runner configures the Uvicorn logger hierarchy rather
 # than the root/module logger. Using a child keeps application INFO messages in
 # the same terminal feed as server startup and request logs.
 logger = logging.getLogger("uvicorn.error.p_gpt")
+persistent_log_path = configure_persistent_logging(
+    logger,
+    backup_count=settings.log_backup_count,
+    level_name=settings.log_level,
+    max_bytes=settings.log_max_bytes,
+    path=settings.log_path,
+)
+logger.info(
+    "P-GPT logging configured: level=%s persistent_log=%s",
+    settings.log_level,
+    persistent_log_path,
+)
 logger.info(f"Running mlflow on tracking URI: {mlflow.get_tracking_uri()}")
 
 @asynccontextmanager
@@ -71,6 +86,73 @@ async def lifespan(app: FastAPI):
         perf_counter() - default_voice_start,
     )
 
+    from speaker.asr import KBWhisperASR, ParakeetASR, SpeakerASRRouter
+
+    logger.info(
+        "Loading English speaker ASR model %s",
+        settings.speaker_asr_model,
+    )
+    speaker_asr_start = perf_counter()
+    parakeet_asr = await asyncio.to_thread(
+        ParakeetASR.from_pretrained,
+        settings.speaker_asr_model,
+    )
+    logger.info(
+        "Loading Swedish speaker ASR model %s revision=%s",
+        settings.speaker_asr_model_sv,
+        settings.speaker_asr_revision_sv,
+    )
+    kb_whisper_asr = await asyncio.to_thread(
+        KBWhisperASR.from_pretrained,
+        settings.speaker_asr_model_sv,
+        settings.speaker_asr_revision_sv,
+    )
+    speaker_asr_router = SpeakerASRRouter(
+        routes={"en": parakeet_asr, "sv": kb_whisper_asr}
+    )
+    app.state.speaker_asr_router = speaker_asr_router
+    app.state.speaker_asr_lock = asyncio.Lock()
+    warmup_audio, warmup_sample_rate = await asyncio.to_thread(
+        sf.read,
+        DEFAULT_VOICE_REFERENCE_PATH,
+        dtype="float32",
+        always_2d=True,
+    )
+    for language, adapter in speaker_asr_router.routes.items():
+        warmup_start = perf_counter()
+        warmup_transcript = await asyncio.to_thread(
+            adapter.transcribe_waveform,
+            warmup_audio,
+            warmup_sample_rate,
+        )
+        if not warmup_transcript:
+            logger.warning(
+                "Speaker ASR warmup completed with an empty transcript: language=%s model=%s",
+                language,
+                adapter.model_id,
+            )
+        logger.info(
+            "Speaker ASR route online: language=%s model=%s device=%s dtype=%s warmup_seconds=%.3f",
+            language,
+            adapter.model_id,
+            adapter.device,
+            getattr(adapter, "dtype", "runtime-managed"),
+            perf_counter() - warmup_start,
+        )
+    if torch.cuda.is_available():
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        logger.info(
+            "Speaker ASR CUDA memory after warmup: allocated_mib=%.1f reserved_mib=%.1f free_mib=%.1f total_mib=%.1f",
+            torch.cuda.memory_allocated() / (1024 * 1024),
+            torch.cuda.memory_reserved() / (1024 * 1024),
+            free_bytes / (1024 * 1024),
+            total_bytes / (1024 * 1024),
+        )
+    logger.info(
+        "All speaker ASR routes are online; load and warmup took %.3fs",
+        perf_counter() - speaker_asr_start,
+    )
+
     try:
         yield
     finally:
@@ -87,6 +169,9 @@ async def lifespan(app: FastAPI):
             await asyncio.gather(*prompt_tasks, return_exceptions=True)
         app.state.voice_clone_prompts.clear()
         app.state.voice_clone_prompt_tasks.clear()
+        app.state.speaker_asr_router.close()
+        del app.state.speaker_asr_router
+        del app.state.speaker_asr_lock
         del app.state.default_voice_clone_prompt
         del app.state.tts_model
         del model
@@ -1188,7 +1273,9 @@ async def _generate_pseudo_stream_audio(
     text: str,
     request: StreamTTSRequest,
     voice_clone_prompt: VoiceClonePrompt | None,
+    diagnostic_context: dict[str, Any] | None = None,
 ) -> bytes:
+    total_start = perf_counter()
     payload = _build_tts_payload(text, request, voice_clone_prompt)
     payload.update(
         {
@@ -1198,8 +1285,10 @@ async def _generate_pseudo_stream_audio(
         }
     )
     inference_task: asyncio.Task[list[Any]] | None = None
+    lock_requested_at = perf_counter()
 
     async with app.state.tts_lock:
+        lock_acquired_at = perf_counter()
         inference_task = asyncio.create_task(
             asyncio.to_thread(app.state.tts_model.generate, **payload)
         )
@@ -1213,6 +1302,7 @@ async def _generate_pseudo_stream_audio(
             # lock until the worker finishes to prevent concurrent inference.
             await inference_task
             raise
+        inference_finished_at = perf_counter()
 
     if not generated_audios:
         raise RuntimeError("OmniVoice generated no audio.")
@@ -1223,7 +1313,58 @@ async def _generate_pseudo_stream_audio(
             f"OmniVoice returned PCM at an unsupported {sample_rate} Hz."
         )
 
-    return _encode_generated_audio(generated_audios[0], sample_rate, "pcm")
+    encoding_started_at = perf_counter()
+    audio_bytes = _encode_generated_audio(generated_audios[0], sample_rate, "pcm")
+    completed_at = perf_counter()
+    timing = calculate_speaker_tts_timing(
+        total_started_at=total_start,
+        lock_requested_at=lock_requested_at,
+        lock_acquired_at=lock_acquired_at,
+        inference_finished_at=inference_finished_at,
+        encoding_started_at=encoding_started_at,
+        completed_at=completed_at,
+        output_bytes=len(audio_bytes),
+        sample_rate=sample_rate,
+    )
+    if diagnostic_context is not None:
+        cuda_allocated_mib = (
+            torch.cuda.memory_allocated() / (1024 * 1024)
+            if torch.cuda.is_available()
+            else 0.0
+        )
+        cuda_reserved_mib = (
+            torch.cuda.memory_reserved() / (1024 * 1024)
+            if torch.cuda.is_available()
+            else 0.0
+        )
+        timing_arguments = (
+            diagnostic_context.get("session_id"),
+            diagnostic_context.get("turn_id"),
+            diagnostic_context.get("turn_revision"),
+            diagnostic_context.get("response_generation"),
+            diagnostic_context.get("segment_id"),
+            len(text),
+            request.num_step,
+            request.speed,
+            timing.lock_wait_seconds,
+            timing.inference_seconds,
+            timing.encoding_seconds,
+            timing.total_seconds,
+            timing.audio_seconds,
+            timing.real_time_factor,
+            cuda_allocated_mib,
+            cuda_reserved_mib,
+        )
+        logger.debug(
+            "Speaker TTS diagnostics: session=%s turn=%s revision=%s generation=%s segment=%s chars=%s steps=%s speed=%.3f lock_wait=%.3fs inference=%.3fs encoding=%.3fs total=%.3fs audio=%.3fs rtf=%.3f cuda_allocated_mib=%.1f cuda_reserved_mib=%.1f",
+            *timing_arguments,
+        )
+        if timing.total_seconds > 5 or timing.real_time_factor > 1:
+            logger.warning(
+                "Speaker TTS slow synthesis: session=%s turn=%s revision=%s generation=%s segment=%s chars=%s steps=%s speed=%.3f lock_wait=%.3fs inference=%.3fs encoding=%.3fs total=%.3fs audio=%.3fs rtf=%.3f cuda_allocated_mib=%.1f cuda_reserved_mib=%.1f",
+                *timing_arguments,
+            )
+    return audio_bytes
 
 
 def _encode_generated_audio(
@@ -1827,3 +1968,180 @@ async def stream_pseudo_stream_audio(request_id: str) -> StreamingResponse:
             )
 
     return StreamingResponse(audio_chunks(), media_type="audio/pcm")
+
+
+@dataclass
+class SpeakerApplicationContext:
+    generation: Any
+    tts_request: StreamTTSRequest
+    voice_clone_prompt: VoiceClonePrompt | None
+
+
+async def _configure_speaker_session(event: Any) -> Any:
+    from speaker import SpeakerConfiguredContext
+
+    await _validate_conversation_model(event.generation.model)
+    system_prompt = await _resolve_persona_system_prompt(
+        event.persona_id,
+        event.persona_name,
+        event.instruction_prompt,
+    )
+    history = [
+        {"role": "system", "content": system_prompt},
+        *[
+            {"role": message.role, "content": message.content}
+            for message in event.history
+            if message.role != "system"
+        ],
+    ]
+
+    voice_clone_prompt = None
+    if event.generation.clone_voice and event.generation.ref_audio:
+        voice_clone_prompt = await _get_or_create_voice_clone_prompt(
+            event.generation.ref_audio
+        )
+    elif event.generation.clone_voice:
+        voice_clone_prompt = app.state.default_voice_clone_prompt
+
+    tts_request = StreamTTSRequest(
+        messages=[],
+        model=event.generation.model,
+        temperature=event.generation.temperature,
+        repeat_penalty=event.generation.repeat_penalty,
+        seed=event.generation.seed,
+        max_tokens=event.generation.max_tokens,
+        response_format="pcm",
+        clone_voice=event.generation.clone_voice,
+        ref_audio=event.generation.ref_audio,
+        num_step=event.generation.num_step,
+        speed=event.generation.speed,
+    )
+    return SpeakerConfiguredContext(
+        application=SpeakerApplicationContext(
+            generation=event.generation,
+            tts_request=tts_request,
+            voice_clone_prompt=voice_clone_prompt,
+        ),
+        history=history,
+    )
+
+
+async def _transcribe_speaker_audio(
+    audio: bytes,
+    language: Literal["en", "sv"],
+) -> str:
+    queue_start = perf_counter()
+    inference_task: asyncio.Task[str] | None = None
+    async with app.state.speaker_asr_lock:
+        queue_seconds = perf_counter() - queue_start
+        adapter = app.state.speaker_asr_router.adapter_for(language)
+        inference_start = perf_counter()
+        logger.info(
+            "Speaker ASR inference acquired: input_language=%s model=%s audio_seconds=%.3f queue_seconds=%.3f device=%s dtype=%s",
+            language,
+            adapter.model_id,
+            len(audio) / (16_000 * 2),
+            queue_seconds,
+            adapter.device,
+            getattr(adapter, "dtype", "runtime-managed"),
+        )
+        inference_task = asyncio.create_task(
+            asyncio.to_thread(adapter.transcribe_pcm16, audio)
+        )
+        try:
+            transcript = await asyncio.shield(inference_task)
+            logger.info(
+                "Speaker ASR inference finished: input_language=%s model=%s inference_seconds=%.3f chars=%s",
+                language,
+                adapter.model_id,
+                perf_counter() - inference_start,
+                len(transcript),
+            )
+            return transcript
+        except asyncio.CancelledError:
+            await inference_task
+            raise
+
+
+async def _stream_speaker_text(
+    context: SpeakerApplicationContext,
+    history: list[dict[str, str]],
+) -> AsyncIterator[str]:
+    generation = context.generation
+    request = TextGenerationRequest(
+        messages=[ChatMessage(**message) for message in history],
+        model=generation.model,
+        temperature=generation.temperature,
+        repeat_penalty=generation.repeat_penalty,
+        seed=generation.seed,
+        max_tokens=generation.max_tokens,
+    )
+    payload = _build_ollama_chat_payload(request)
+    payload["stream"] = True
+    async with httpx.AsyncClient(timeout=60) as client:
+        async with client.stream(
+            "POST",
+            f"{OLLAMA_BASE_URL}/api/chat",
+            json=payload,
+        ) as response:
+            response.raise_for_status()
+            async for line in response.aiter_lines():
+                if not line:
+                    continue
+                try:
+                    response_part = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(
+                        "Ollama returned an invalid streaming response."
+                    ) from exc
+                message = response_part.get("message")
+                content = message.get("content") if isinstance(message, dict) else None
+                if isinstance(content, str) and content:
+                    yield content
+
+
+async def _synthesize_speaker_sentence(
+    context: SpeakerApplicationContext,
+    sentence: str,
+    metadata: Any,
+) -> bytes:
+    return await _generate_pseudo_stream_audio(
+        sentence,
+        context.tts_request,
+        context.voice_clone_prompt,
+        {
+            "response_generation": metadata.response_generation,
+            "segment_id": metadata.segment_id,
+            "session_id": metadata.session_id,
+            "turn_id": metadata.turn_id,
+            "turn_revision": metadata.turn_revision,
+        },
+    )
+
+
+@app.websocket("/speaker/v1")
+async def speaker_websocket(websocket: WebSocket) -> None:
+    from speaker import SpeakerServices, SpeakerSession
+
+    offered_protocols = {
+        protocol.strip()
+        for protocol in websocket.headers.get("sec-websocket-protocol", "").split(",")
+        if protocol.strip()
+    }
+    if "p-gpt-speaker.v1" not in offered_protocols:
+        await websocket.close(code=1002)
+        return
+
+    await websocket.accept(subprotocol="p-gpt-speaker.v1")
+    session = SpeakerSession(
+        websocket,
+        SpeakerServices(
+            configure=_configure_speaker_session,
+            transcribe=_transcribe_speaker_audio,
+            stream_text=_stream_speaker_text,
+            synthesize=_synthesize_speaker_sentence,
+        ),
+        logger,
+        reopen_grace_seconds=settings.speaker_reopen_grace_seconds,
+    )
+    await session.run()

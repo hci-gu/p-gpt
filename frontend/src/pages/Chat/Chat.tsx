@@ -39,10 +39,21 @@ import {
 import { SpeechInput } from '@/components/ai-elements/speech-input'
 import type { TranscriptionEvent } from '@/components/ai-elements/speech-input'
 import { Suggestions } from '@/components/ai-elements/suggestion'
+import { SpeechLanguageToggle } from '@/components/speech-language-toggle'
 import { Spinner } from '@/components/ui/spinner'
 import { Slider } from '@/components/ui/slider'
 import { Switch } from '@/components/ui/switch'
-import { MessageSquareTextIcon, SpeechIcon, Volume2Icon } from 'lucide-react'
+import { useSpeakerVad } from '@/hooks/use-speaker-vad'
+import { useSpeakerSession } from '@/hooks/use-speaker-session'
+import { usePreferencesStore } from '@/src/state/preferences'
+import {
+  MessageSquareTextIcon,
+  MicIcon,
+  MicOffIcon,
+  RadioIcon,
+  SpeechIcon,
+  Volume2Icon,
+} from 'lucide-react'
 import type { ChangeEvent } from 'react'
 import { useCallback, useMemo, useRef, useState } from 'react'
 import defaultPersonProfileImageUrl from '../../../assets/default-person-pfp.png'
@@ -130,6 +141,67 @@ const VolumeControl = ({
   )
 }
 
+const SpeakerMicrophoneControl = ({
+  disabled,
+  error,
+  isMuted,
+  onMute,
+  onUnmute,
+}: {
+  disabled: boolean
+  error: string | null
+  isMuted: boolean
+  onMute: () => void
+  onUnmute: () => void
+}) => {
+  const label = disabled
+    ? 'Microphone unavailable while speaker mode connects'
+    : isMuted
+      ? 'Unmute microphone'
+      : 'Mute microphone'
+
+  return (
+    <button
+      aria-label={label}
+      className={`flex size-8 shrink-0 items-center justify-center rounded-md border border-border/25 bg-accent/10 text-muted-foreground shadow-[0_1px_2px_hsl(0_0%_0%/0.04)] transition-colors hover:bg-accent hover:text-accent-foreground disabled:cursor-not-allowed disabled:opacity-50 ${
+        error ? 'border-destructive/50 text-destructive' : ''
+      }`}
+      disabled={disabled}
+      onClick={isMuted ? onUnmute : onMute}
+      title={error ?? label}
+      type="button"
+    >
+      {isMuted ? (
+        <MicOffIcon aria-hidden="true" className="size-4" />
+      ) : (
+        <MicIcon aria-hidden="true" className="size-4" />
+      )}
+    </button>
+  )
+}
+
+const VoiceDetectionIndicator = ({ active }: { active: boolean }) => (
+  <div
+    aria-label={active ? 'Voice detected' : 'No voice detected'}
+    className="flex h-8 shrink-0 items-center gap-1.5 rounded-md border border-border/25 bg-accent/10 px-2 text-muted-foreground text-xs shadow-[0_1px_2px_hsl(0_0%_0%/0.04)]"
+    role="status"
+    title={active ? 'Voice detected' : 'Listening for voice'}
+  >
+    <span
+      aria-hidden="true"
+      className={`size-2 rounded-full transition-colors ${
+        active
+          ? 'bg-green-500 shadow-[0_0_10px_hsl(142_71%_45%_/_0.9)]'
+          : 'bg-muted-foreground/35'
+      }`}
+    />
+    <RadioIcon aria-hidden="true" className="size-3.5" />
+    <span className="sr-only">
+      {active ? 'Voice detected' : 'No voice detected'}
+    </span>
+  </div>
+)
+
 const ChatPage = () => {
   const text = useChatStore((state) => state.text)
   const status = useChatStore((state) => state.status)
@@ -159,6 +231,12 @@ const ChatPage = () => {
   const interruptAssistantResponse = useChatStore(
     (state) => state.interruptAssistantResponse
   )
+  const speechLanguage = usePreferencesStore(
+    (state) => state.generationParameters.speechLanguage
+  )
+  const setGenerationParameter = usePreferencesStore(
+    (state) => state.setGenerationParameter
+  )
   const [isTranscribing, setIsTranscribing] = useState(false)
   const [isVoiceOnlyMode, setIsVoiceOnlyMode] = useState(false)
   const [ttsVolume, setTtsVolume] = useState(DEFAULT_TTS_VOLUME)
@@ -167,6 +245,26 @@ const ChatPage = () => {
   const [completedAssistantMessageId, setCompletedAssistantMessageId] =
     useState<string | null>(null)
   const transcriptionAnimationRef = useRef<number | null>(null)
+  const isGenerating = status === 'submitted' || status === 'streaming'
+  const activePersona = personas.find(
+    (persona) => persona.id === (activePersonaId ?? selectedPersonaId)
+  )
+  const speakerSession = useSpeakerSession({
+    enabled: isVoiceOnlyMode,
+    persona: activePersona,
+    volume: ttsVolume,
+  })
+  const {
+    error: speakerVadError,
+    isMuted: isSpeakerMicrophoneMuted,
+    isVoiceActive,
+    mute: muteSpeakerMicrophone,
+    unmute: unmuteSpeakerMicrophone,
+  } = useSpeakerVad({
+    detectionProfile: speakerSession.status === 'speaking' ? 'barge-in' : 'start',
+    enabled: speakerSession.canCapture,
+    onAudioEvent: speakerSession.onAudioEvent,
+  })
 
   const handleSubmit = useCallback(
     (message: PromptInputMessage) => {
@@ -306,19 +404,21 @@ const ChatPage = () => {
     )
   }, [])
 
-  const isGenerating = status === 'submitted' || status === 'streaming'
   const isSubmitDisabled = useMemo(
     () => !isGenerating && (!text.trim() || isTranscribing),
     [isGenerating, isTranscribing, text]
   )
   const shouldShowSuggestions = messages.length === 0 && !isVoiceOnlyMode
-  const voiceAvatarScale = 1 + assistantAudioLevel * 0.05
-  const voiceGlowOpacity = isAssistantAudioPlaying
-    ? 0.38 + assistantAudioLevel * 0.46
+  const displayedAudioLevel = isVoiceOnlyMode
+    ? speakerSession.audioLevel
+    : assistantAudioLevel
+  const displayedAudioPlaying = isVoiceOnlyMode
+    ? speakerSession.isPlaying
+    : isAssistantAudioPlaying
+  const voiceAvatarScale = 1 + displayedAudioLevel * 0.05
+  const voiceGlowOpacity = displayedAudioPlaying
+    ? 0.38 + displayedAudioLevel * 0.46
     : 0
-  const activePersona = personas.find(
-    (persona) => persona.id === (activePersonaId ?? selectedPersonaId)
-  )
   const activePersonaProfileImageUrl =
     activePersona?.profilePictureUrl ?? defaultPersonProfileImageUrl
 
@@ -404,6 +504,11 @@ const ChatPage = () => {
                               getAssistantFallbackText(version.contentStatus)}
                           </MessageResponse>
                         )}
+                        {version.finishReason === 'interrupted' && (
+                          <p className="mt-1 text-muted-foreground text-xs italic">
+                            Interrupted
+                          </p>
+                        )}
                       </MessageContent>
                     </div>
                   </Message>
@@ -422,12 +527,12 @@ const ChatPage = () => {
         <ConversationScrollButton />
       </Conversation>
       {isVoiceOnlyMode && (
-        <div className="flex min-h-0 flex-1 items-center justify-center p-6">
+        <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-6 p-6">
           <div className="relative flex size-[22rem] items-center justify-center sm:size-[28rem]">
             <div
               aria-hidden="true"
               className={
-                isAssistantAudioPlaying
+                displayedAudioPlaying
                   ? 'voice-avatar-blue-pulse'
                   : 'voice-avatar-blue-idle'
               }
@@ -442,12 +547,33 @@ const ChatPage = () => {
               className="relative z-10 size-72 rounded-full border-4 border-background object-cover shadow-xl transition-transform duration-150 sm:size-[22rem]"
               src={activePersonaProfileImageUrl}
               style={{
-                boxShadow: isAssistantAudioPlaying
+                boxShadow: displayedAudioPlaying
                   ? '0 0 0 14px hsl(210 100% 72% / 0.26), 0 0 64px hsl(210 100% 56% / 0.36)'
                   : '0 18px 45px hsl(0 0% 0% / 0.18)',
                 transform: `scale(${voiceAvatarScale})`,
               }}
             />
+          </div>
+          <div className="grid min-h-24 w-full max-w-2xl gap-2 text-center">
+            <p className="font-medium text-muted-foreground text-sm capitalize">
+              {speakerSession.status}
+            </p>
+            {speakerSession.latestUserTranscript && (
+              <p className="text-foreground/70 text-sm">
+                You: {speakerSession.latestUserTranscript}
+              </p>
+            )}
+            {speakerSession.latestAssistantTranscript && (
+              <p className="text-base text-foreground">
+                {activePersona?.name ?? 'Persona'}:{' '}
+                {speakerSession.latestAssistantTranscript}
+              </p>
+            )}
+            {speakerSession.error && (
+              <p className="text-destructive text-sm" role="alert">
+                {speakerSession.error}
+              </p>
+            )}
           </div>
         </div>
       )}
@@ -474,19 +600,21 @@ const ChatPage = () => {
                 onValueChange={setTtsVolume}
                 value={ttsVolume}
               />
-              <SpeechInput
-                className="shrink-0"
-                defaultLanguage="en"
-                disabled={isGenerating}
-                onTranscriptionChange={handleTranscriptionChange}
-                onTranscriptionProcessingChange={
-                  handleTranscriptionProcessingChange
+              <SpeechLanguageToggle
+                disabled={!speakerSession.canChangeLanguage}
+                language={speechLanguage}
+                onLanguageChange={(language) =>
+                  setGenerationParameter('speechLanguage', language)
                 }
-                onTranscriptionStart={handleTranscriptionStart}
-                showMicrophone={false}
-                size="icon-sm"
-                variant="ghost"
               />
+              <SpeakerMicrophoneControl
+                disabled={!speakerSession.canCapture}
+                error={speakerVadError ?? speakerSession.error}
+                isMuted={isSpeakerMicrophoneMuted}
+                onMute={muteSpeakerMicrophone}
+                onUnmute={unmuteSpeakerMicrophone}
+              />
+              <VoiceDetectionIndicator active={isVoiceActive} />
             </div>
           </div>
         ) : (
@@ -524,7 +652,10 @@ const ChatPage = () => {
                   />
                   <SpeechInput
                     className="shrink-0"
-                    defaultLanguage="en"
+                    language={speechLanguage}
+                    onLanguageChange={(language) =>
+                      setGenerationParameter('speechLanguage', language)
+                    }
                     onTranscriptionChange={handleTranscriptionChange}
                     onTranscriptionProcessingChange={
                       handleTranscriptionProcessingChange
