@@ -7,6 +7,9 @@ import types
 import unittest
 from unittest.mock import AsyncMock, patch
 
+from fastapi import HTTPException
+from pydantic import ValidationError
+
 fake_mlflow = types.ModuleType("mlflow")
 fake_mlflow.get_tracking_uri = lambda: "test"
 fake_mlflow.genai = types.SimpleNamespace()
@@ -30,7 +33,20 @@ fake_omnivoice.OmniVoice = type("OmniVoice", (), {})
 fake_omnivoice.VoiceClonePrompt = type("VoiceClonePrompt", (), {})
 sys.modules["omnivoice"] = fake_omnivoice
 
-import app
+from app import app as fastapi_app
+from routers import personas as persona_router
+from schemas import (
+    ChatMessage,
+    InitiateRequest,
+    OllamaModelsResponse,
+    PersonaInput,
+    PersonaPreparationRequest,
+    PersonaProfile,
+)
+from services import ollama as ollama_service
+from services import personas as persona_service
+from services import requests as request_service
+from state import persona_preparations
 
 
 class FakeResponse:
@@ -119,10 +135,10 @@ class PersonaExtractionTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with (
-            patch.object(app.settings, "n_retries", 3),
-            patch.object(app.httpx, "AsyncClient", return_value=client),
+            patch.object(persona_service.settings, "n_retries", 3),
+            patch.object(persona_service.httpx, "AsyncClient", return_value=client),
         ):
-            profile = await app._extract_persona_profile("Persona instructions")
+            profile = await persona_service.extract_persona_profile("Persona instructions")
 
         self.assertEqual(profile.problem, "Anxiety")
         self.assertEqual(len(payloads), 2)
@@ -142,11 +158,11 @@ class PersonaExtractionTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with (
-            patch.object(app.settings, "n_retries", 3),
-            patch.object(app.httpx, "AsyncClient", return_value=client),
+            patch.object(persona_service.settings, "n_retries", 3),
+            patch.object(persona_service.httpx, "AsyncClient", return_value=client),
         ):
-            with self.assertRaises(app.HTTPException) as raised:
-                await app._extract_persona_profile("Persona instructions")
+            with self.assertRaises(HTTPException) as raised:
+                await persona_service.extract_persona_profile("Persona instructions")
 
         self.assertEqual(raised.exception.status_code, 502)
         self.assertIn("3 attempts", raised.exception.detail)
@@ -173,11 +189,11 @@ class PersonaExtractionTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with (
-            patch.object(app.settings, "n_retries", 3),
-            patch.object(app.httpx, "AsyncClient", return_value=client),
+            patch.object(persona_service.settings, "n_retries", 3),
+            patch.object(persona_service.httpx, "AsyncClient", return_value=client),
             patch.object(asyncio, "sleep", new=AsyncMock()) as sleep,
         ):
-            profile = await app._extract_persona_profile("Persona instructions")
+            profile = await persona_service.extract_persona_profile("Persona instructions")
 
         self.assertEqual(profile.problem, "Grief")
         sleep.assert_awaited_once_with(0.25)
@@ -188,11 +204,11 @@ class PersonaExtractionTests(unittest.IsolatedAsyncioTestCase):
         client = FakeAsyncClient([FakeResponse(400, {})], payloads)
 
         with (
-            patch.object(app.settings, "n_retries", 3),
-            patch.object(app.httpx, "AsyncClient", return_value=client),
+            patch.object(persona_service.settings, "n_retries", 3),
+            patch.object(persona_service.httpx, "AsyncClient", return_value=client),
         ):
-            with self.assertRaises(app.HTTPException) as raised:
-                await app._extract_persona_profile("Persona instructions")
+            with self.assertRaises(HTTPException) as raised:
+                await persona_service.extract_persona_profile("Persona instructions")
 
         self.assertEqual(raised.exception.status_code, 502)
         self.assertEqual(len(payloads), 1)
@@ -201,38 +217,38 @@ class PersonaExtractionTests(unittest.IsolatedAsyncioTestCase):
 class PersonaPromptCacheTests(unittest.IsolatedAsyncioTestCase):
     def test_instruction_change_produces_a_new_cache_key(self):
         prompt = FakePrompt()
-        first = app.PersonaInput(
+        first = PersonaInput(
             id="persona-1",
             name="Morgan",
             instruction_prompt="First instruction",
         )
-        second = app.PersonaInput(
+        second = PersonaInput(
             id="persona-1",
             name="Morgan",
             instruction_prompt="Changed instruction",
         )
 
         self.assertNotEqual(
-            app._persona_cache_key(first, prompt),
-            app._persona_cache_key(second, prompt),
+            persona_service.persona_cache_key(first, prompt),
+            persona_service.persona_cache_key(second, prompt),
         )
 
     def test_duplicate_names_are_isolated_by_persona_id(self):
         prompt = FakePrompt()
-        first = app.PersonaInput(
+        first = PersonaInput(
             id="persona-1",
             name="Morgan",
             instruction_prompt="Shared instructions",
         )
-        second = app.PersonaInput(
+        second = PersonaInput(
             id="persona-2",
             name="Morgan",
             instruction_prompt="Shared instructions",
         )
 
         self.assertNotEqual(
-            app._persona_cache_key(first, prompt),
-            app._persona_cache_key(second, prompt),
+            persona_service.persona_cache_key(first, prompt),
+            persona_service.persona_cache_key(second, prompt),
         )
 
     def test_legacy_cache_schema_adds_persona_id(self):
@@ -251,8 +267,8 @@ class PersonaPromptCacheTests(unittest.IsolatedAsyncioTestCase):
             )
             connection.close()
 
-            with patch.object(app.settings, "persona_prompt_cache_path", cache_path):
-                upgraded = app._open_persona_prompt_cache()
+            with patch.object(persona_service.settings, "persona_prompt_cache_path", cache_path):
+                upgraded = persona_service.open_prompt_cache()
                 columns = {
                     row[1]
                     for row in upgraded.execute(
@@ -264,32 +280,32 @@ class PersonaPromptCacheTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("persona_id", columns)
 
     async def test_cache_hit_skips_extraction(self):
-        persona = app.PersonaInput(
+        persona = PersonaInput(
             id="persona-1",
             name="Morgan",
             instruction_prompt="Persona instructions",
         )
         prompt = FakePrompt()
-        cache_key = app._persona_cache_key(persona, prompt)
+        cache_key = persona_service.persona_cache_key(persona, prompt)
 
         with tempfile.TemporaryDirectory() as directory:
             cache_path = str(Path(directory) / "cache.sqlite3")
-            with patch.object(app.settings, "persona_prompt_cache_path", cache_path):
-                app._write_cached_system_prompt(
+            with patch.object(persona_service.settings, "persona_prompt_cache_path", cache_path):
+                persona_service.write_cached_system_prompt(
                     cache_key,
                     persona.id,
                     persona.name,
                     "cached",
                 )
                 with (
-                    patch.object(app, "load_prompt", return_value=prompt),
+                    patch.object(persona_service, "load_prompt", return_value=prompt),
                     patch.object(
-                        app,
-                        "_extract_persona_profile",
+                        persona_service,
+                        "extract_persona_profile",
                         new=AsyncMock(),
                     ) as extract,
                 ):
-                    result = await app._resolve_persona_system_prompt(
+                    result = await persona_service.resolve_system_prompt(
                         persona.id,
                         persona.name,
                         persona.instruction_prompt,
@@ -299,13 +315,13 @@ class PersonaPromptCacheTests(unittest.IsolatedAsyncioTestCase):
         extract.assert_not_awaited()
 
     async def test_cache_miss_extracts_renders_and_persists(self):
-        persona = app.PersonaInput(
+        persona = PersonaInput(
             id="persona-1",
             name="Morgan",
             instruction_prompt="Persona instructions",
         )
         prompt = FakePrompt()
-        profile = app.PersonaProfile(
+        profile = PersonaProfile(
             problem="Anxiety",
             background="Avoids unfamiliar social situations.",
         )
@@ -313,20 +329,20 @@ class PersonaPromptCacheTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             cache_path = str(Path(directory) / "cache.sqlite3")
             with (
-                patch.object(app.settings, "persona_prompt_cache_path", cache_path),
-                patch.object(app, "load_prompt", return_value=prompt),
+                patch.object(persona_service.settings, "persona_prompt_cache_path", cache_path),
+                patch.object(persona_service, "load_prompt", return_value=prompt),
                 patch.object(
-                    app,
-                    "_extract_persona_profile",
+                    persona_service,
+                    "extract_persona_profile",
                     new=AsyncMock(return_value=profile),
                 ) as extract,
             ):
-                result = await app._resolve_persona_system_prompt(
+                result = await persona_service.resolve_system_prompt(
                     persona.id,
                     persona.name,
                     persona.instruction_prompt,
                 )
-                cached_result = await app._resolve_persona_system_prompt(
+                cached_result = await persona_service.resolve_system_prompt(
                     persona.id,
                     persona.name,
                     persona.instruction_prompt,
@@ -342,11 +358,11 @@ class PersonaPromptCacheTests(unittest.IsolatedAsyncioTestCase):
     async def test_logs_created_prompt_and_changed_instruction_update(self):
         prompt = FakePrompt()
         profiles = [
-            app.PersonaProfile(
+            PersonaProfile(
                 problem="Anxiety",
                 background="Avoids unfamiliar social situations.",
             ),
-            app.PersonaProfile(
+            PersonaProfile(
                 problem="Grief",
                 background="Recently lost a close friend.",
             ),
@@ -355,21 +371,21 @@ class PersonaPromptCacheTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             cache_path = str(Path(directory) / "cache.sqlite3")
             with (
-                patch.object(app.settings, "persona_prompt_cache_path", cache_path),
-                patch.object(app, "load_prompt", return_value=prompt),
+                patch.object(persona_service.settings, "persona_prompt_cache_path", cache_path),
+                patch.object(persona_service, "load_prompt", return_value=prompt),
                 patch.object(
-                    app,
-                    "_extract_persona_profile",
+                    persona_service,
+                    "extract_persona_profile",
                     new=AsyncMock(side_effect=profiles),
                 ),
                 self.assertLogs("uvicorn.error.p_gpt", level="INFO") as logs,
             ):
-                await app._resolve_persona_system_prompt(
+                await persona_service.resolve_system_prompt(
                     "persona-1",
                     "Morgan",
                     "First instruction",
                 )
-                await app._resolve_persona_system_prompt(
+                await persona_service.resolve_system_prompt(
                     "persona-1",
                     "Morgan",
                     "Changed instruction",
@@ -384,12 +400,12 @@ class PersonaPromptCacheTests(unittest.IsolatedAsyncioTestCase):
 
 class PersonaPreparationTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        app.persona_preparations.clear()
-        app.app.state.voice_clone_prompts = {}
-        app.app.state.voice_clone_prompt_tasks = {}
+        persona_preparations.clear()
+        fastapi_app.state.voice_clone_prompts = {}
+        fastapi_app.state.voice_clone_prompt_tasks = {}
 
     async def test_preparation_warms_changed_prompt_and_voice(self):
-        request = app.PersonaPreparationRequest(
+        request = PersonaPreparationRequest(
             persona_id="persona-1",
             persona_name="Morgan",
             instruction_prompt="Changed instructions",
@@ -400,34 +416,36 @@ class PersonaPreparationTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(
-                app,
-                "_resolve_persona_system_prompt",
+                request_service,
+                "resolve_system_prompt",
                 new=AsyncMock(return_value="system prompt"),
             ) as resolve,
             patch.object(
-                app,
-                "_get_or_create_voice_clone_prompt",
+                request_service,
+                "get_or_create_voice_clone_prompt",
                 new=AsyncMock(return_value=object()),
             ) as prepare_voice,
         ):
-            created = await app.create_persona_preparation(request)
-            state = app.persona_preparations[created["id"]]
+            created = await persona_router.create_persona_preparation(
+                request, types.SimpleNamespace(app=fastapi_app)
+            )
+            state = persona_preparations[created["id"]]
             self.assertIsNotNone(state.task)
             await state.task
 
-        status = await app.get_persona_preparation(created["id"])
+        status = await persona_router.get_persona_preparation(created["id"])
         self.assertEqual(status["status"], "ready")
         resolve.assert_awaited_once_with(
             "persona-1", "Morgan", "Changed instructions"
         )
         prepare_voice.assert_awaited_once_with(
-            "http://localhost:8090/api/files/personas/new.wav"
+            fastapi_app, "http://localhost:8090/api/files/personas/new.wav"
         )
 
     async def test_voice_replacement_evicts_the_previous_cached_prompt(self):
         previous_url = "http://localhost:8090/api/files/personas/old.wav"
-        app.app.state.voice_clone_prompts[previous_url] = object()
-        request = app.PersonaPreparationRequest(
+        fastapi_app.state.voice_clone_prompts[previous_url] = object()
+        request = PersonaPreparationRequest(
             persona_id="persona-1",
             persona_name="Morgan",
             instruction_prompt="Instructions",
@@ -437,19 +455,21 @@ class PersonaPreparationTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with patch.object(
-            app,
-            "_get_or_create_voice_clone_prompt",
+            request_service,
+            "get_or_create_voice_clone_prompt",
             new=AsyncMock(return_value=object()),
         ):
-            created = await app.create_persona_preparation(request)
-            await app.persona_preparations[created["id"]].task
+            created = await persona_router.create_persona_preparation(
+                request, types.SimpleNamespace(app=fastapi_app)
+            )
+            await persona_preparations[created["id"]].task
 
-        self.assertNotIn(previous_url, app.app.state.voice_clone_prompts)
-        status = await app.get_persona_preparation(created["id"])
+        self.assertNotIn(previous_url, fastapi_app.state.voice_clone_prompts)
+        status = await persona_router.get_persona_preparation(created["id"])
         self.assertEqual(status["status"], "ready")
 
     async def test_failed_preparation_reports_an_error_without_discarding_state(self):
-        request = app.PersonaPreparationRequest(
+        request = PersonaPreparationRequest(
             persona_id="persona-1",
             persona_name="Morgan",
             instruction_prompt="Invalid instructions",
@@ -457,21 +477,23 @@ class PersonaPreparationTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with patch.object(
-            app,
-            "_resolve_persona_system_prompt",
+            request_service,
+            "resolve_system_prompt",
             new=AsyncMock(side_effect=RuntimeError("parser unavailable")),
         ):
-            created = await app.create_persona_preparation(request)
-            await app.persona_preparations[created["id"]].task
+            created = await persona_router.create_persona_preparation(
+                request, types.SimpleNamespace(app=fastapi_app)
+            )
+            await persona_preparations[created["id"]].task
 
-        status = await app.get_persona_preparation(created["id"])
+        status = await persona_router.get_persona_preparation(created["id"])
         self.assertEqual(status["status"], "error")
         self.assertEqual(status["error"], "parser unavailable")
 
 
 class RequestSafetyTests(unittest.TestCase):
     def test_ui_numeric_values_are_unchanged_inside_ranges(self):
-        request = app.InitiateRequest(
+        request = InitiateRequest(
             persona_id="persona-1",
             persona_name="Morgan",
             instruction_prompt="Persona instructions",
@@ -490,7 +512,7 @@ class RequestSafetyTests(unittest.TestCase):
         self.assertEqual(request.num_step, 27)
 
     def test_ui_numeric_values_are_clamped_to_frontend_ranges(self):
-        low = app.InitiateRequest(
+        low = InitiateRequest(
             persona_id="persona-1",
             persona_name="Morgan",
             instruction_prompt="Persona instructions",
@@ -501,7 +523,7 @@ class RequestSafetyTests(unittest.TestCase):
             seed=-100,
             num_step=-100,
         )
-        high = app.InitiateRequest(
+        high = InitiateRequest(
             persona_id="persona-1",
             persona_name="Morgan",
             instruction_prompt="Persona instructions",
@@ -529,8 +551,8 @@ class RequestSafetyTests(unittest.TestCase):
         )
 
     def test_non_numeric_value_is_rejected(self):
-        with self.assertRaises(app.ValidationError):
-            app.InitiateRequest(
+        with self.assertRaises(ValidationError):
+            InitiateRequest(
                 persona_id="persona-1",
                 persona_name="Morgan",
                 instruction_prompt="Persona instructions",
@@ -547,68 +569,68 @@ class OllamaModelTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         with (
-            patch.object(app.settings, "ollama_text_model", "configured"),
-            patch.object(app.httpx, "AsyncClient", return_value=client),
+            patch.object(ollama_service.settings, "ollama_text_model", "configured"),
+            patch.object(ollama_service.httpx, "AsyncClient", return_value=client),
         ):
-            result = await app._get_available_ollama_models()
+            result = await ollama_service.get_available_models()
 
         self.assertEqual(result.models, ["configured", "second"])
         self.assertFalse(result.used_fallback)
 
     async def test_model_listing_uses_configured_fallback_when_offline(self):
-        client = FakeTagsClient(app.httpx.ConnectError("offline"))
+        client = FakeTagsClient(ollama_service.httpx.ConnectError("offline"))
         with (
-            patch.object(app.settings, "ollama_text_model", "configured"),
-            patch.object(app.httpx, "AsyncClient", return_value=client),
+            patch.object(ollama_service.settings, "ollama_text_model", "configured"),
+            patch.object(ollama_service.httpx, "AsyncClient", return_value=client),
         ):
-            result = await app._get_available_ollama_models()
+            result = await ollama_service.get_available_models()
 
         self.assertEqual(result.models, ["configured"])
         self.assertTrue(result.used_fallback)
 
     async def test_model_validation_accepts_reported_model(self):
-        response = app.OllamaModelsResponse(
+        response = OllamaModelsResponse(
             models=["configured", "selected"],
             default_model="configured",
             used_fallback=False,
         )
         with patch.object(
-            app,
-            "_get_available_ollama_models",
+            ollama_service,
+            "get_available_models",
             new=AsyncMock(return_value=response),
         ):
-            await app._validate_conversation_model("selected")
+            await ollama_service.validate_model("selected")
 
     async def test_model_validation_rejects_unavailable_model(self):
-        response = app.OllamaModelsResponse(
+        response = OllamaModelsResponse(
             models=["configured"],
             default_model="configured",
             used_fallback=True,
         )
         with patch.object(
-            app,
-            "_get_available_ollama_models",
+            ollama_service,
+            "get_available_models",
             new=AsyncMock(return_value=response),
         ):
-            with self.assertRaises(app.HTTPException) as raised:
-                await app._validate_conversation_model("unavailable")
+            with self.assertRaises(HTTPException) as raised:
+                await ollama_service.validate_model("unavailable")
 
         self.assertEqual(raised.exception.status_code, 422)
 
 
 class ConversationConstructionTests(unittest.TestCase):
     def test_backend_replaces_all_client_system_messages(self):
-        request = app.InitiateRequest(
+        request = InitiateRequest(
             persona_id="persona-1",
             persona_name="Morgan",
             instruction_prompt="Persona instructions",
             messages=[
-                app.ChatMessage(role="system", content="untrusted"),
-                app.ChatMessage(role="user", content="hello"),
+                ChatMessage(role="system", content="untrusted"),
+                ChatMessage(role="user", content="hello"),
             ],
         )
 
-        result = app._stream_request_from_initiate_request(
+        result = request_service.stream_request_from_initiate_request(
             request,
             "trusted system prompt",
         )
