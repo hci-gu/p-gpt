@@ -20,18 +20,33 @@ export type SpeakerAudioEvent =
   | {
       activity:
         | 'audio_context'
+        | 'capture_recovery_completed'
+        | 'capture_recovery_exhausted'
+        | 'capture_recovery_started'
         | 'capture_started'
         | 'capture_stalled'
         | 'capture_stopped'
         | 'inference_timeout'
         | 'microphone_ended'
         | 'probability_summary'
+        | 'stale_event'
+        | 'vad_config'
+        | 'vad_state'
+        | 'worker_summary'
         | 'worker_error'
         | 'worker_ready'
+      captureEpoch?: number
       detail?: string
+      detectionProfile?: 'barge-in' | 'start'
+      pendingFrameCount?: number
+      processingAverageMilliseconds?: number
+      processingMaximumMilliseconds?: number
       probabilityAverage?: number
       probabilityMax?: number
       probabilityMin?: number
+      queueDelayAverageMilliseconds?: number
+      queueDelayMaximumMilliseconds?: number
+      recoveryCount?: number
       sampleCount?: number
       type: 'vad-diagnostic'
     }

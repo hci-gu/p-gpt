@@ -3,24 +3,40 @@ import {
   speakerAudioSampleRate,
   speakerVadFrameSamples,
 } from '@/src/lib/speaker-audio'
+import type { SpeakerVadDetectionProfile } from '@/src/lib/speaker-vad-config'
 import { SpeakerVadStateMachine } from '@/src/lib/speaker-vad-state'
 
 type VadWorkerRequest =
-  | { type: 'init' }
-  | { audio: Float32Array; type: 'process' }
-  | { type: 'reset' }
+  | { epoch: number; type: 'init' }
+  | {
+      audio: Float32Array
+      capturedAt: number
+      epoch: number
+      profile: SpeakerVadDetectionProfile
+      sequence: number
+      type: 'process'
+    }
+  | { epoch: number; type: 'reset' }
 
 type VadWorkerResponse =
-  | { type: 'ready' }
-  | { active: boolean; type: 'activity-change' }
-  | { type: 'speech-start' }
-  | { type: 'speech-candidate' }
-  | { type: 'speech-candidate-cancelled' }
-  | { audio: Float32Array; type: 'audio-frame' }
-  | { probability: number; type: 'speech-probability' }
-  | { type: 'speech-end' }
-  | { type: 'input-limit' }
-  | { error: string; type: 'error' }
+  | { epoch: number; type: 'ready' }
+  | { epoch: number; type: 'reset-complete' }
+  | { active: boolean; epoch: number; sequence: number; type: 'activity-change' }
+  | { diagnosticDetail?: string; epoch: number; sequence: number; type: 'speech-start' }
+  | { diagnosticDetail?: string; epoch: number; sequence: number; type: 'speech-candidate' }
+  | { diagnosticDetail?: string; epoch: number; sequence: number; type: 'speech-candidate-cancelled' }
+  | { audio: Float32Array; epoch: number; sequence: number; type: 'audio-frame' }
+  | {
+      epoch: number
+      probability: number
+      processingMilliseconds: number
+      queueDelayMilliseconds: number
+      sequence: number
+      type: 'speech-probability'
+    }
+  | { diagnosticDetail?: string; epoch: number; sequence: number; type: 'speech-end' }
+  | { epoch: number; sequence: number; type: 'input-limit' }
+  | { epoch: number; error: string; type: 'error' }
 
 type VadModel = {
   (inputs: {
@@ -42,6 +58,7 @@ let state = new Float32Array(2 * 128)
 let context = new Float32Array(contextSamples)
 let vadState = new SpeakerVadStateMachine()
 let processingPromise: Promise<void> = Promise.resolve()
+let currentEpoch = 0
 
 const postWorkerMessage = (message: VadWorkerResponse) => {
   if (message.type === 'audio-frame') {
@@ -61,9 +78,7 @@ const getErrorMessage = (error: unknown) =>
   error instanceof Error ? error.message : 'Voice activity detection failed.'
 
 const reset = () => {
-  for (const event of vadState.reset()) {
-    postWorkerMessage(event)
-  }
+  vadState.reset()
   vadState = new SpeakerVadStateMachine()
   state = new Float32Array(2 * 128)
   context = new Float32Array(contextSamples)
@@ -146,11 +161,35 @@ const withInferenceTimeout = <Value>(promise: Promise<Value>) =>
     )
   })
 
-const processAudioFrame = async (audio: Float32Array) => {
-  const probability = await withInferenceTimeout(evaluateSpeechProbability(audio))
-  postWorkerMessage({ probability, type: 'speech-probability' })
-  for (const event of vadState.process(audio, probability)) {
-    postWorkerMessage(event)
+const processAudioFrame = async (
+  message: Extract<VadWorkerRequest, { type: 'process' }>,
+  queuedAt: number
+) => {
+  if (message.epoch !== currentEpoch) {
+    return
+  }
+  const processingStartedAt = performance.now()
+  const probability = await withInferenceTimeout(
+    evaluateSpeechProbability(message.audio)
+  )
+  if (message.epoch !== currentEpoch) {
+    return
+  }
+  const processingMilliseconds = performance.now() - processingStartedAt
+  postWorkerMessage({
+    epoch: message.epoch,
+    probability,
+    processingMilliseconds,
+    queueDelayMilliseconds: Math.max(0, processingStartedAt - queuedAt),
+    sequence: message.sequence,
+    type: 'speech-probability',
+  })
+  for (const event of vadState.process(message.audio, probability, message.profile)) {
+    postWorkerMessage({
+      ...event,
+      epoch: message.epoch,
+      sequence: message.sequence,
+    })
   }
 }
 
@@ -158,25 +197,52 @@ self.addEventListener('message', (event: MessageEvent<VadWorkerRequest>) => {
   const message = event.data
 
   if (message.type === 'reset') {
+    currentEpoch = message.epoch
     processingPromise = processingPromise
-      .then(() => reset())
+      .then(() => {
+        reset()
+        if (message.epoch === currentEpoch) {
+          postWorkerMessage({ epoch: message.epoch, type: 'reset-complete' })
+        }
+      })
       .catch((error) => {
-        postWorkerMessage({ error: getErrorMessage(error), type: 'error' })
+        postWorkerMessage({
+          epoch: message.epoch,
+          error: getErrorMessage(error),
+          type: 'error',
+        })
       })
     return
   }
 
   if (message.type === 'init') {
-    void loadModel()
-      .then(() => postWorkerMessage({ type: 'ready' }))
-      .catch((error) => postWorkerMessage({ error: getErrorMessage(error), type: 'error' }))
+    currentEpoch = message.epoch
+    const resetBarrier = processingPromise
+    void Promise.all([loadModel(), resetBarrier])
+      .then(() => {
+        if (message.epoch === currentEpoch) {
+          postWorkerMessage({ epoch: message.epoch, type: 'ready' })
+        }
+      })
+      .catch((error) =>
+        postWorkerMessage({
+          epoch: message.epoch,
+          error: getErrorMessage(error),
+          type: 'error',
+        })
+      )
     return
   }
 
+  const queuedAt = performance.now()
   processingPromise = processingPromise
-    .then(() => processAudioFrame(message.audio))
+    .then(() => processAudioFrame(message, queuedAt))
     .catch((error) => {
-      postWorkerMessage({ error: getErrorMessage(error), type: 'error' })
+      postWorkerMessage({
+        epoch: message.epoch,
+        error: getErrorMessage(error),
+        type: 'error',
+      })
     })
 })
 

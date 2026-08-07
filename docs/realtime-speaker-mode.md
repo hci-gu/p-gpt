@@ -48,15 +48,45 @@ share one ASR lock and the existing OmniVoice lock. A stale request waiting
 for a lock is discarded before output; a PyTorch call already running cannot be
 safely interrupted and retains its lock until it returns.
 
-The reopen grace gate defaults to 1.5 seconds. Change it with
+The reopen grace gate defaults to 1 second. Change it with
 
 ```dotenv
-P_GPT_SPEAKER_REOPEN_GRACE_SECONDS=1.5
+P_GPT_SPEAKER_REOPEN_GRACE_SECONDS=1.0
 ```
 
 Values from 0.25 through 5 seconds are accepted. Increasing it makes short
 pauses more likely to remain one user turn, but delays the earliest possible
-TTS playback by the same amount.
+TTS playback by the same amount. With the default 384 ms VAD soft-end, the
+default minimum last-speech-to-commit delay is approximately 1.384 seconds.
+
+## Client VAD tuning
+
+Speaker capture uses 32 ms frames. By default, a turn begins when four frames
+within a six-frame activation attempt reach a speech probability of 0.40. Once
+active, the lower 0.30 continuation threshold keeps quiet syllables from
+starting the silence counter. Twelve quiet frames (384 ms) soft-end the turn,
+and the preceding 24 frames (768 ms) are retained as pre-roll.
+
+These build-time settings can be placed in the frontend environment:
+
+```dotenv
+VITE_SPEAKER_VAD_START_THRESHOLD=0.40
+VITE_SPEAKER_VAD_START_REQUIRED_FRAMES=4
+VITE_SPEAKER_VAD_START_WINDOW_FRAMES=6
+VITE_SPEAKER_VAD_CONTINUE_THRESHOLD=0.30
+VITE_SPEAKER_VAD_PRE_ROLL_FRAMES=24
+VITE_SPEAKER_VAD_SOFT_END_FRAMES=12
+VITE_SPEAKER_VAD_BARGE_THRESHOLD=0.40
+VITE_SPEAKER_VAD_BARGE_REQUIRED_FRAMES=4
+VITE_SPEAKER_VAD_BARGE_WINDOW_FRAMES=6
+```
+
+The barge-in profile is independent so interruption sensitivity can be tuned
+without changing ordinary speech starts. Invalid values or a required-frame
+count larger than its activation window use the documented defaults and write
+a browser warning. Vite embeds these settings at build time, so changing them
+requires rebuilding the frontend. Changing the backend grace value requires a
+backend restart.
 
 ## Persistent diagnostics
 
@@ -71,15 +101,28 @@ P_GPT_LOG_MAX_BYTES=10485760
 P_GPT_LOG_BACKUP_COUNT=5
 ```
 
-`INFO` records pipeline timing and lifecycle milestones. `DEBUG` additionally
-records control-state transitions, stale-generation drops, capture progress,
-and one-second client VAD probability summaries. VAD diagnostics contain no
+`INFO` records pipeline timing and lifecycle milestones. It also warns when a
+speaker TTS segment takes more than five seconds or synthesis is slower than
+the produced audio in real time. `DEBUG` additionally records control-state
+transitions, stale-generation drops, capture epochs and recoveries, effective
+VAD configuration, candidate decisions, worker backlog and processing latency,
+one-second VAD probability summaries, TTS lock/inference/encoding timing,
+transcript commit delivery timing, and browser playback scheduling summaries.
+Playback summaries include PCM chunk counts, minimum scheduling lead, and
+underrun counts for each segment. Transcript diagnostics record only timing and
+generation metadata, never transcript text. VAD and TTS diagnostics contain no
 audio or transcript text. Restart the backend after changing the level.
 
-The browser also writes speaker transport and VAD transitions to its developer
-console with the `[speaker-session]` and `[speaker-vad]` prefixes. Persistent
-copies of the privacy-safe VAD summaries are forwarded over the speaker socket
-to the backend log when `DEBUG` is enabled.
+The browser also writes speaker transport, PCM chunk scheduling, transcript
+render timing, and VAD transitions to its developer console with the
+`[speaker-session]`, `[speaker-playback]`, and `[speaker-vad]` prefixes.
+Persistent copies of privacy-safe VAD, playback, underrun, and transcript
+render-timing summaries are forwarded over the speaker socket to the backend
+log when `DEBUG` is enabled.
+
+An isolated capture or VAD-worker stall is recovered automatically. Three
+stalls within 60 seconds mute capture and show an error instead of repeatedly
+restarting. Manually unmuting begins a fresh recovery window.
 
 For validation, run:
 

@@ -261,6 +261,7 @@ const ChatPage = () => {
     mute: muteSpeakerMicrophone,
     unmute: unmuteSpeakerMicrophone,
   } = useSpeakerVad({
+    detectionProfile: speakerSession.status === 'speaking' ? 'barge-in' : 'start',
     enabled: speakerSession.canCapture,
     onAudioEvent: speakerSession.onAudioEvent,
   })

@@ -1,14 +1,28 @@
 import { speakerOutputSampleRate } from '@/src/lib/speaker-audio'
 
 type Segment = {
+  chunkCount: number
   done: boolean
   generation: number
   id: string
+  minimumSchedulingLeadMilliseconds: number
   pendingSources: number
   text: string
+  underrunCount: number
+}
+
+export type SpeakerPlaybackDiagnostic = {
+  activity: 'playback_buffer_underrun' | 'playback_segment_scheduled'
+  chunkCount?: number
+  generation: number
+  minimumSchedulingLeadMilliseconds?: number
+  schedulingLeadMilliseconds?: number
+  segmentId: string
+  underrunCount?: number
 }
 
 type PlaybackCallbacks = {
+  onDiagnostic?: (diagnostic: SpeakerPlaybackDiagnostic) => void
   onLevelChange: (level: number) => void
   onPlayingChange: (playing: boolean) => void
   onResponseCompleted: (generation: number) => void
@@ -23,11 +37,17 @@ type BrowserWindow = Window &
 const getAudioContextConstructor = () =>
   window.AudioContext ?? (window as BrowserWindow).webkitAudioContext
 
+const schedulingLeadSeconds = 0.08
+
 export class SpeakerPcmPlayback {
   private readonly callbacks: PlaybackCallbacks
   private context: AudioContext | null = null
   private gain: GainNode | null = null
   private nextStartTime = 0
+  private schedulingQueue: Promise<void> = Promise.resolve()
+  private playbackEpoch = 0
+  private timelineGeneration: number | null = null
+  private hasScheduledAudio = false
   private activeSegment: Segment | null = null
   private segments = new Map<string, Segment>()
   private sources = new Set<AudioBufferSourceNode>()
@@ -47,24 +67,57 @@ export class SpeakerPcmPlayback {
   }
 
   beginSegment(generation: number, id: string, text: string) {
+    if (this.timelineGeneration !== generation && this.sources.size === 0) {
+      this.timelineGeneration = generation
+      this.hasScheduledAudio = false
+      this.nextStartTime = this.context?.currentTime ?? 0
+    }
     const segment: Segment = {
+      chunkCount: 0,
       done: false,
       generation,
       id,
+      minimumSchedulingLeadMilliseconds: Number.POSITIVE_INFINITY,
       pendingSources: 0,
       text,
+      underrunCount: 0,
     }
     this.activeSegment = segment
     this.segments.set(id, segment)
   }
 
-  async pushPcm16(generation: number, value: ArrayBuffer) {
+  pushPcm16(generation: number, value: ArrayBuffer): Promise<void> {
     const segment = this.activeSegment
     if (!segment || segment.generation !== generation || value.byteLength < 2) {
+      return Promise.resolve()
+    }
+    const epoch = this.playbackEpoch
+    segment.chunkCount += 1
+    // Count queued chunks immediately. A segment_done control message may be
+    // received before the async AudioContext scheduling work has completed.
+    segment.pendingSources += 1
+    const schedulingTask = this.schedulingQueue.then(() =>
+      this.schedulePcm16(epoch, segment, value)
+    )
+    // Keep later chunks ordered even if one scheduling operation fails. The
+    // returned task still rejects so the session can surface the playback error.
+    this.schedulingQueue = schedulingTask.catch(() => undefined)
+    return schedulingTask
+  }
+
+  private async schedulePcm16(
+    epoch: number,
+    segment: Segment,
+    value: ArrayBuffer
+  ) {
+    if (epoch !== this.playbackEpoch || !this.segments.has(segment.id)) {
       return
     }
     const context = this.ensureContext()
     await context.resume()
+    if (epoch !== this.playbackEpoch || !this.segments.has(segment.id)) {
+      return
+    }
     const usableBytes = value.byteLength - (value.byteLength % 2)
     const sampleCount = usableBytes / 2
     const audioBuffer = context.createBuffer(1, sampleCount, speakerOutputSampleRate)
@@ -83,20 +136,43 @@ export class SpeakerPcmPlayback {
     const source = context.createBufferSource()
     source.buffer = audioBuffer
     source.connect(this.gain as GainNode)
-    segment.pendingSources += 1
     this.sources.add(source)
     this.callbacks.onPlayingChange(true)
-    const startTime = Math.max(
-      this.nextStartTime,
-      context.currentTime + (this.sources.size === 1 ? 0.08 : 0)
+    const previousEndTime = this.nextStartTime
+    const wasUnderrun =
+      this.hasScheduledAudio && previousEndTime <= context.currentTime
+    const startTime = wasUnderrun
+      ? context.currentTime + schedulingLeadSeconds
+      : Math.max(
+          previousEndTime,
+          context.currentTime + (this.hasScheduledAudio ? 0 : schedulingLeadSeconds)
+        )
+    const schedulingLeadMilliseconds =
+      (startTime - context.currentTime) * 1_000
+    segment.minimumSchedulingLeadMilliseconds = Math.min(
+      segment.minimumSchedulingLeadMilliseconds,
+      schedulingLeadMilliseconds
     )
+    if (wasUnderrun) {
+      segment.underrunCount += 1
+      this.callbacks.onDiagnostic?.({
+        activity: 'playback_buffer_underrun',
+        generation: segment.generation,
+        schedulingLeadMilliseconds,
+        segmentId: segment.id,
+      })
+    }
     source.start(startTime)
     this.nextStartTime = startTime + audioBuffer.duration
+    this.hasScheduledAudio = true
     source.onended = () => {
       this.sources.delete(source)
       segment.pendingSources = Math.max(0, segment.pendingSources - 1)
       this.maybeCompleteSegment(segment)
-      if (this.sources.size === 0) {
+      const hasQueuedAudio = [...this.segments.values()].some(
+        (value) => value.pendingSources > 0
+      )
+      if (this.sources.size === 0 && !hasQueuedAudio) {
         this.callbacks.onLevelChange(0)
         this.callbacks.onPlayingChange(false)
       }
@@ -112,6 +188,24 @@ export class SpeakerPcmPlayback {
     if (this.activeSegment?.id === id) {
       this.activeSegment = null
     }
+    const scheduledThroughSegment = this.schedulingQueue
+    void scheduledThroughSegment.then(() => {
+      if (!this.segments.has(segment.id)) {
+        return
+      }
+      this.callbacks.onDiagnostic?.({
+        activity: 'playback_segment_scheduled',
+        chunkCount: segment.chunkCount,
+        generation: segment.generation,
+        minimumSchedulingLeadMilliseconds: Number.isFinite(
+          segment.minimumSchedulingLeadMilliseconds
+        )
+          ? segment.minimumSchedulingLeadMilliseconds
+          : undefined,
+        segmentId: segment.id,
+        underrunCount: segment.underrunCount,
+      })
+    })
     this.maybeCompleteSegment(segment)
   }
 
@@ -121,6 +215,8 @@ export class SpeakerPcmPlayback {
   }
 
   clear() {
+    this.playbackEpoch += 1
+    this.schedulingQueue = Promise.resolve()
     for (const source of this.sources) {
       source.onended = null
       try {
@@ -133,6 +229,8 @@ export class SpeakerPcmPlayback {
     this.segments.clear()
     this.responseAudioDone.clear()
     this.activeSegment = null
+    this.timelineGeneration = null
+    this.hasScheduledAudio = false
     this.nextStartTime = this.context?.currentTime ?? 0
     this.callbacks.onLevelChange(0)
     this.callbacks.onPlayingChange(false)

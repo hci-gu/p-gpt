@@ -63,6 +63,7 @@ export const useSpeakerSession = ({
   const [isPlaying, setIsPlaying] = useState(false)
   const [isLanguageUpdating, setIsLanguageUpdating] = useState(false)
   const [audioLevel, setAudioLevel] = useState(0)
+  const [transcriptRenderSequence, setTranscriptRenderSequence] = useState(0)
   const [latestUserTranscript, setLatestUserTranscript] = useState<string | null>(
     null
   )
@@ -86,6 +87,10 @@ export const useSpeakerSession = ({
   const pendingLanguageRef = useRef<SpeechLanguage | null>(null)
   const languageUpdatingRef = useRef(false)
   const generationParametersRef = useRef(generationParameters)
+  const pendingTranscriptRenderRef = useRef<{
+    generation: number
+    receivedAtMilliseconds: number
+  } | null>(null)
   const sendEventRef = useRef<(type: string, values?: Record<string, unknown>) => void>(
     () => undefined
   )
@@ -130,6 +135,21 @@ export const useSpeakerSession = ({
   const playerRef = useRef<SpeakerPcmPlayback | null>(null)
   if (!playerRef.current && typeof window !== 'undefined') {
     playerRef.current = new SpeakerPcmPlayback(volume, {
+      onDiagnostic: (diagnostic) => {
+        console.debug('[speaker-playback] diagnostic', diagnostic)
+        sendEventRef.current('client.speaker_diagnostic', {
+          activity: diagnostic.activity,
+          chunkCount: diagnostic.chunkCount,
+          minimumSchedulingLeadMilliseconds:
+            diagnostic.minimumSchedulingLeadMilliseconds,
+          phase: phaseRef.current,
+          responseGeneration: diagnostic.generation,
+          schedulingLeadMilliseconds:
+            diagnostic.schedulingLeadMilliseconds,
+          segmentId: diagnostic.segmentId,
+          underrunCount: diagnostic.underrunCount,
+        })
+      },
       onLevelChange: setAudioLevel,
       onPlayingChange: (playing) => {
         setIsPlaying(playing)
@@ -159,6 +179,26 @@ export const useSpeakerSession = ({
   useEffect(() => {
     playerRef.current?.setVolume(volume)
   }, [volume])
+
+  useEffect(() => {
+    const pending = pendingTranscriptRenderRef.current
+    if (!pending || transcriptRenderSequence === 0) {
+      return
+    }
+    pendingTranscriptRenderRef.current = null
+    const receiveToRenderMilliseconds =
+      performance.now() - pending.receivedAtMilliseconds
+    console.debug('[speaker-session] transcript rendered', {
+      generation: pending.generation,
+      receiveToRenderMilliseconds,
+    })
+    sendEventRef.current('client.speaker_diagnostic', {
+      activity: 'transcript_rendered',
+      phase: phaseRef.current,
+      receiveToRenderMilliseconds,
+      responseGeneration: pending.generation,
+    })
+  }, [transcriptRenderSequence])
 
   const commitInterruptedLocally = useCallback((generation: number | null) => {
     if (generation === null || committedGenerationsRef.current.has(generation)) {
@@ -300,9 +340,23 @@ export const useSpeakerSession = ({
           return
         case 'input.transcription.committed':
           if (serverEvent.text) {
+            const receivedAtMilliseconds = performance.now()
+            if (serverEvent.responseGeneration !== undefined) {
+              pendingTranscriptRenderRef.current = {
+                generation: serverEvent.responseGeneration,
+                receivedAtMilliseconds,
+              }
+            }
+            console.debug('[speaker-session] transcript commit received', {
+              generation: serverEvent.responseGeneration,
+              receivedAtMilliseconds,
+            })
             setLatestUserTranscript(serverEvent.text)
             setLatestAssistantTranscript(null)
             commitUser(serverEvent.text)
+            if (serverEvent.responseGeneration !== undefined) {
+              setTranscriptRenderSequence((value) => value + 1)
+            }
           }
           phaseRef.current = 'responding'
           return
@@ -596,11 +650,23 @@ export const useSpeakerSession = ({
     if (audioEvent.type === 'vad-diagnostic') {
       sendEvent('client.vad_diagnostic', {
         activity: audioEvent.activity,
+        captureEpoch: audioEvent.captureEpoch,
         detail: audioEvent.detail,
+        detectionProfile: audioEvent.detectionProfile,
+        pendingFrameCount: audioEvent.pendingFrameCount,
         phase: phaseRef.current,
+        processingAverageMilliseconds:
+          audioEvent.processingAverageMilliseconds,
+        processingMaximumMilliseconds:
+          audioEvent.processingMaximumMilliseconds,
         probabilityAverage: audioEvent.probabilityAverage,
         probabilityMax: audioEvent.probabilityMax,
         probabilityMin: audioEvent.probabilityMin,
+        queueDelayAverageMilliseconds:
+          audioEvent.queueDelayAverageMilliseconds,
+        queueDelayMaximumMilliseconds:
+          audioEvent.queueDelayMaximumMilliseconds,
+        recoveryCount: audioEvent.recoveryCount,
         sampleCount: audioEvent.sampleCount,
       })
       return
