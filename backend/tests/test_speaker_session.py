@@ -129,8 +129,17 @@ class SentenceSegmenterTests(unittest.TestCase):
 
         self.assertEqual(segmenter.feed("Wait."), [])
         self.assertEqual(segmenter.feed("."), [])
-        self.assertEqual(segmenter.feed(". I need a moment"), ["Wait..."])
-        self.assertEqual(segmenter.finish(), ["I need a moment"])
+        self.assertEqual(segmenter.feed(". I need a moment"), [])
+        self.assertEqual(segmenter.finish(), ["Wait... I need a moment"])
+
+    def test_longer_ellipsis_phrase_can_stream_independently(self):
+        segmenter = SentenceSegmenter()
+
+        self.assertEqual(
+            segmenter.feed("Let me consider... The answer follows"),
+            ["Let me consider..."],
+        )
+        self.assertEqual(segmenter.finish(), ["The answer follows"])
 
     def test_standalone_ellipsis_is_attached_to_following_text(self):
         segmenter = SentenceSegmenter()
@@ -267,7 +276,7 @@ class SpeakerSessionTests(unittest.IsolatedAsyncioTestCase):
         await self.session._configure(configuration())
 
     async def test_configuration_defaults_to_english(self):
-        self.assertEqual(REOPEN_GRACE_SECONDS, 2.0)
+        self.assertEqual(REOPEN_GRACE_SECONDS, 1.0)
         self.assertEqual(self.session.input_language, "en")
         ready = [
             value
@@ -330,6 +339,23 @@ class SpeakerSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(diagnostic.detection_profile, "barge-in")
         self.assertEqual(diagnostic.pending_frame_count, 3)
         self.assertEqual(diagnostic.processing_average_milliseconds, 4.5)
+
+    async def test_speaker_client_diagnostics_accept_playback_and_render_timings(self):
+        diagnostic = event(
+            "client.speaker_diagnostic",
+            activity="playback_segment_scheduled",
+            phase="responding",
+            responseGeneration=4,
+            segmentId="4:2",
+            chunkCount=12,
+            underrunCount=0,
+            minimumSchedulingLeadMilliseconds=73.5,
+        )
+
+        self.assertEqual(diagnostic.response_generation, 4)
+        self.assertEqual(diagnostic.segment_id, "4:2")
+        self.assertEqual(diagnostic.chunk_count, 12)
+        self.assertEqual(diagnostic.minimum_scheduling_lead_milliseconds, 73.5)
 
     async def test_candidate_hold_preserves_the_original_grace_deadline(self):
         loop = asyncio.get_running_loop()
@@ -466,6 +492,19 @@ class SpeakerSessionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(self.session.audio_done)
         self.assertEqual(len(self.session.segment_order), 2)
+        event_types = [
+            value["type"]
+            for kind, value in self.websocket.sent
+            if kind == "json"
+        ]
+        self.assertLess(
+            event_types.index("input.transcription.committed"),
+            event_types.index("response.started"),
+        )
+        self.assertLess(
+            event_types.index("response.started"),
+            event_types.index("response.audio.segment_started"),
+        )
         generation = self.session.current_generation
         self.assertIsNotNone(generation)
         for segment_id in self.session.segment_order:

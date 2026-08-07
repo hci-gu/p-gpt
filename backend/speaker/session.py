@@ -18,6 +18,7 @@ from .protocol import (
     ResponseCancelEvent,
     SessionConfigureEvent,
     SessionUpdateEvent,
+    SpeakerClientDiagnosticEvent,
     SpeakerClientEvent,
     SpeakerInputLanguage,
     SpeechCandidateCancelledEvent,
@@ -31,7 +32,7 @@ from .protocol import (
 INPUT_FRAME_BYTES = 1_024
 MAX_UTTERANCE_BYTES = 60 * 16_000 * 2
 OUTPUT_CHUNK_BYTES = 24_000 * 2 // 10
-REOPEN_GRACE_SECONDS = 2.0
+REOPEN_GRACE_SECONDS = 1.0
 
 
 @dataclass
@@ -61,9 +62,14 @@ class SpeakerServices:
 
 
 class SentenceSegmenter:
-    def __init__(self, maximum_characters: int = 180) -> None:
+    def __init__(
+        self,
+        maximum_characters: int = 180,
+        minimum_ellipsis_characters: int = 12,
+    ) -> None:
         self.buffer = ""
         self.maximum_characters = maximum_characters
+        self.minimum_ellipsis_characters = minimum_ellipsis_characters
 
     @staticmethod
     def _is_abbreviation(text: str) -> bool:
@@ -82,6 +88,10 @@ class SentenceSegmenter:
             "st",
             "vs",
         }
+
+    @staticmethod
+    def _ends_with_ellipsis(text: str) -> bool:
+        return text.rstrip('"\' )]').endswith(("...", "…"))
 
     def feed(self, value: str) -> list[str]:
         self.buffer += value
@@ -109,6 +119,17 @@ class SentenceSegmenter:
             # Never enqueue punctuation by itself. Retaining it in the buffer
             # attaches a standalone ellipsis to the following spoken phrase.
             if candidate and not any(character.isalnum() for character in candidate):
+                index = end
+                continue
+            # Very short interjections followed by an ellipsis sound like a
+            # TTS restart when synthesized independently. Keep them buffered
+            # so the following phrase provides enough prosodic context while
+            # retaining the ellipsis as an audible pause cue.
+            if (
+                candidate
+                and len(candidate) < self.minimum_ellipsis_characters
+                and self._ends_with_ellipsis(candidate)
+            ):
                 index = end
                 continue
             if candidate:
@@ -252,6 +273,21 @@ class SpeakerSession:
                 event.processing_maximum_milliseconds,
                 event.queue_delay_average_milliseconds,
                 event.queue_delay_maximum_milliseconds,
+            )
+        elif isinstance(event, SpeakerClientDiagnosticEvent):
+            self.logger.debug(
+                "Speaker client diagnostic: session=%s state=%s client_phase=%s activity=%s generation=%s segment=%s chunks=%s underruns=%s scheduling_lead_ms=%s minimum_scheduling_lead_ms=%s receive_to_render_ms=%s",
+                self.session_id,
+                self.state,
+                event.phase,
+                event.activity,
+                event.response_generation,
+                event.segment_id,
+                event.chunk_count,
+                event.underrun_count,
+                event.scheduling_lead_milliseconds,
+                event.minimum_scheduling_lead_milliseconds,
+                event.receive_to_render_milliseconds,
             )
 
     async def _configure(self, event: SessionConfigureEvent) -> None:
@@ -535,12 +571,23 @@ class SpeakerSession:
             self._require_current(turn_id, revision, generation)
             self.context.history.append({"role": "user", "content": transcript})
             self.state = "responding"
+            commit_started = perf_counter()
             await self._send_json(
                 "input.transcription.committed",
                 turnId=turn_id,
                 turnRevision=revision,
                 responseGeneration=generation,
                 text=transcript,
+            )
+            self.logger.info(
+                "Speaker transcription committed: session=%s turn=%s revision=%s generation=%s soft_end_elapsed=%.3fs socket_send=%.3fs chars=%s",
+                self.session_id,
+                turn_id,
+                revision,
+                generation,
+                perf_counter() - stage_start,
+                perf_counter() - commit_started,
+                len(transcript),
             )
             await self._send_json(
                 "response.started",

@@ -149,6 +149,29 @@ class VadDiagnosticEvent(ClientEvent):
     probability_max: float | None = Field(default=None, ge=0, le=1)
 
 
+class SpeakerClientDiagnosticEvent(ClientEvent):
+    type: Literal["client.speaker_diagnostic"]
+    activity: Literal[
+        "playback_buffer_underrun",
+        "playback_segment_scheduled",
+        "transcript_rendered",
+    ]
+    phase: Literal["idle", "capturing", "grace", "responding"]
+    response_generation: int | None = Field(default=None, ge=1)
+    segment_id: str | None = Field(default=None, min_length=1, max_length=128)
+    chunk_count: int | None = Field(default=None, ge=0, le=100_000)
+    underrun_count: int | None = Field(default=None, ge=0, le=100_000)
+    scheduling_lead_milliseconds: float | None = Field(
+        default=None, ge=-60_000, le=60_000
+    )
+    minimum_scheduling_lead_milliseconds: float | None = Field(
+        default=None, ge=-60_000, le=60_000
+    )
+    receive_to_render_milliseconds: float | None = Field(
+        default=None, ge=0, le=60_000
+    )
+
+
 SpeakerClientEvent = Annotated[
     SessionConfigureEvent
     | SessionUpdateEvent
@@ -160,7 +183,8 @@ SpeakerClientEvent = Annotated[
     | ResponseCancelEvent
     | PlaybackSegmentCompletedEvent
     | PlaybackResponseCompletedEvent
-    | VadDiagnosticEvent,
+    | VadDiagnosticEvent
+    | SpeakerClientDiagnosticEvent,
     Field(discriminator="type"),
 ]
 
