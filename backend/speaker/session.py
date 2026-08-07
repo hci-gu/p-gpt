@@ -31,13 +31,22 @@ from .protocol import (
 INPUT_FRAME_BYTES = 1_024
 MAX_UTTERANCE_BYTES = 60 * 16_000 * 2
 OUTPUT_CHUNK_BYTES = 24_000 * 2 // 10
-REOPEN_GRACE_SECONDS = 1.5
+REOPEN_GRACE_SECONDS = 2.0
 
 
 @dataclass
 class SpeakerConfiguredContext:
     application: Any
     history: list[dict[str, str]]
+
+
+@dataclass(frozen=True)
+class SpeakerSynthesisMetadata:
+    session_id: str
+    turn_id: str
+    turn_revision: int
+    response_generation: int
+    segment_id: str
 
 
 @dataclass
@@ -48,7 +57,7 @@ class SpeakerServices:
         [Any, list[dict[str, str]]],
         AsyncIterator[str],
     ]
-    synthesize: Callable[[Any, str], Awaitable[bytes]]
+    synthesize: Callable[[Any, str, SpeakerSynthesisMetadata], Awaitable[bytes]]
 
 
 class SentenceSegmenter:
@@ -225,16 +234,24 @@ class SpeakerSession:
             await self._cancel_response("client_cancelled")
         elif isinstance(event, VadDiagnosticEvent):
             self.logger.debug(
-                "Speaker client VAD: session=%s state=%s client_phase=%s activity=%s detail=%s samples=%s probability_min=%s probability_average=%s probability_max=%s",
+                "Speaker client VAD: session=%s state=%s client_phase=%s activity=%s detail=%s epoch=%s profile=%s recovery=%s pending=%s samples=%s probability_min=%s probability_average=%s probability_max=%s processing_average_ms=%s processing_maximum_ms=%s queue_average_ms=%s queue_maximum_ms=%s",
                 self.session_id,
                 self.state,
                 event.phase,
                 event.activity,
                 event.detail,
+                event.capture_epoch,
+                event.detection_profile,
+                event.recovery_count,
+                event.pending_frame_count,
                 event.sample_count,
                 event.probability_min,
                 event.probability_average,
                 event.probability_max,
+                event.processing_average_milliseconds,
+                event.processing_maximum_milliseconds,
+                event.queue_delay_average_milliseconds,
+                event.queue_delay_maximum_milliseconds,
             )
 
     async def _configure(self, event: SessionConfigureEvent) -> None:
@@ -553,6 +570,13 @@ class SpeakerSession:
                 audio_bytes = await self.services.synthesize(
                     self.context.application,
                     sentence,
+                    SpeakerSynthesisMetadata(
+                        session_id=self.session_id,
+                        turn_id=turn_id,
+                        turn_revision=revision,
+                        response_generation=generation,
+                        segment_id=segment_id,
+                    ),
                 )
                 self._require_current(turn_id, revision, generation)
                 self.logger.info(

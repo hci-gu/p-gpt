@@ -13,11 +13,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from speaker.protocol import parse_client_event
 from speaker.asr import KBWhisperASR, ParakeetASR, SpeakerASRRouter
 from speaker.session import (
+    REOPEN_GRACE_SECONDS,
     SentenceSegmenter,
     SpeakerConfiguredContext,
     SpeakerServices,
     SpeakerSession,
 )
+from speaker.tts_metrics import calculate_speaker_tts_timing
 
 
 def event(event_type: str, **values):
@@ -80,6 +82,7 @@ def services(
     transcript="Hello",
     response="A first sentence. A second sentence.",
     transcribed_languages=None,
+    synthesis_metadata=None,
 ):
     async def configure(_event):
         return SpeakerConfiguredContext(
@@ -95,7 +98,9 @@ def services(
     async def stream_text(_context, _history):
         yield response
 
-    async def synthesize(_context, _text):
+    async def synthesize(_context, _text, metadata):
+        if synthesis_metadata is not None:
+            synthesis_metadata.append(metadata)
         return bytes(4_800)
 
     return SpeakerServices(
@@ -144,6 +149,27 @@ class SentenceSegmenterTests(unittest.TestCase):
 
         self.assertEqual(segmenter.feed("..."), [])
         self.assertEqual(segmenter.finish(), [])
+
+
+class SpeakerTtsTimingTests(unittest.TestCase):
+    def test_lock_inference_encoding_total_and_real_time_are_distinct(self):
+        timing = calculate_speaker_tts_timing(
+            total_started_at=10,
+            lock_requested_at=10.25,
+            lock_acquired_at=10.75,
+            inference_finished_at=12.75,
+            encoding_started_at=12.8,
+            completed_at=13,
+            output_bytes=96_000,
+            sample_rate=24_000,
+        )
+
+        self.assertAlmostEqual(timing.lock_wait_seconds, 0.5)
+        self.assertAlmostEqual(timing.inference_seconds, 2.0)
+        self.assertAlmostEqual(timing.encoding_seconds, 0.2)
+        self.assertAlmostEqual(timing.total_seconds, 3.0)
+        self.assertAlmostEqual(timing.audio_seconds, 2.0)
+        self.assertAlmostEqual(timing.real_time_factor, 1.0)
 
 
 class ParakeetAdapterTests(unittest.TestCase):
@@ -241,6 +267,7 @@ class SpeakerSessionTests(unittest.IsolatedAsyncioTestCase):
         await self.session._configure(configuration())
 
     async def test_configuration_defaults_to_english(self):
+        self.assertEqual(REOPEN_GRACE_SECONDS, 2.0)
         self.assertEqual(self.session.input_language, "en")
         ready = [
             value
@@ -283,6 +310,91 @@ class SpeakerSessionTests(unittest.IsolatedAsyncioTestCase):
             if kind == "json" and value["type"] == "error"
         ]
         self.assertEqual(errors[-1]["code"], "session_busy")
+
+    async def test_vad_diagnostics_accept_optional_recovery_and_timing_fields(self):
+        diagnostic = event(
+            "client.vad_diagnostic",
+            activity="probability_summary",
+            phase="idle",
+            captureEpoch=4,
+            detectionProfile="barge-in",
+            pendingFrameCount=3,
+            processingAverageMilliseconds=4.5,
+            processingMaximumMilliseconds=7.5,
+            queueDelayAverageMilliseconds=1.5,
+            queueDelayMaximumMilliseconds=2.5,
+            recoveryCount=1,
+        )
+
+        self.assertEqual(diagnostic.capture_epoch, 4)
+        self.assertEqual(diagnostic.detection_profile, "barge-in")
+        self.assertEqual(diagnostic.pending_frame_count, 3)
+        self.assertEqual(diagnostic.processing_average_milliseconds, 4.5)
+
+    async def test_candidate_hold_preserves_the_original_grace_deadline(self):
+        loop = asyncio.get_running_loop()
+        self.session.state = "grace"
+        self.session.turn_id = "turn-hold"
+        self.session.turn_revision = 0
+        self.session.grace_deadline = loop.time() + 2
+        original_deadline = self.session.grace_deadline
+
+        await self.session._speech_candidate(
+            event(
+                "input.speech_candidate",
+                turnId="turn-hold",
+                turnRevision=0,
+            )
+        )
+        self.assertTrue(self.session.grace_held)
+        self.assertEqual(self.session.grace_deadline, original_deadline)
+
+        await self.session._speech_candidate_cancelled(
+            event(
+                "input.speech_candidate_cancelled",
+                turnId="turn-hold",
+                turnRevision=0,
+            )
+        )
+        self.assertFalse(self.session.grace_held)
+        self.assertEqual(self.session.grace_deadline, original_deadline)
+
+    async def test_synthesis_receives_turn_and_segment_metadata(self):
+        metadata = []
+        session = SpeakerSession(
+            FakeWebSocket(),
+            services(response="Hello.", synthesis_metadata=metadata),
+            logging.getLogger("speaker-metadata-test"),
+            reopen_grace_seconds=0,
+        )
+        await session._configure(configuration())
+        await session._speech_started(
+            event(
+                "input.speech_started",
+                turnId="turn-metadata",
+                turnRevision=0,
+                reopened=False,
+            )
+        )
+        await session._handle_audio(bytes(1_024))
+        await session._speech_soft_ended(
+            event(
+                "input.speech_soft_ended",
+                turnId="turn-metadata",
+                turnRevision=0,
+            )
+        )
+        for _ in range(50):
+            await asyncio.sleep(0)
+            if metadata:
+                break
+        session._invalidate_pipeline()
+
+        self.assertEqual(metadata[0].session_id, session.session_id)
+        self.assertEqual(metadata[0].turn_id, "turn-metadata")
+        self.assertEqual(metadata[0].turn_revision, 0)
+        self.assertEqual(metadata[0].response_generation, 1)
+        self.assertEqual(metadata[0].segment_id, "1:1")
 
     async def test_selected_language_is_passed_to_transcription(self):
         languages = []

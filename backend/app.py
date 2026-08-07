@@ -27,6 +27,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from omnivoice import OmniVoice, VoiceClonePrompt
 from pydantic import BaseModel, Field, ValidationError, field_validator
+from speaker.tts_metrics import calculate_speaker_tts_timing
 
 # FastAPI's development runner configures the Uvicorn logger hierarchy rather
 # than the root/module logger. Using a child keeps application INFO messages in
@@ -1272,7 +1273,9 @@ async def _generate_pseudo_stream_audio(
     text: str,
     request: StreamTTSRequest,
     voice_clone_prompt: VoiceClonePrompt | None,
+    diagnostic_context: dict[str, Any] | None = None,
 ) -> bytes:
+    total_start = perf_counter()
     payload = _build_tts_payload(text, request, voice_clone_prompt)
     payload.update(
         {
@@ -1282,8 +1285,10 @@ async def _generate_pseudo_stream_audio(
         }
     )
     inference_task: asyncio.Task[list[Any]] | None = None
+    lock_requested_at = perf_counter()
 
     async with app.state.tts_lock:
+        lock_acquired_at = perf_counter()
         inference_task = asyncio.create_task(
             asyncio.to_thread(app.state.tts_model.generate, **payload)
         )
@@ -1297,6 +1302,7 @@ async def _generate_pseudo_stream_audio(
             # lock until the worker finishes to prevent concurrent inference.
             await inference_task
             raise
+        inference_finished_at = perf_counter()
 
     if not generated_audios:
         raise RuntimeError("OmniVoice generated no audio.")
@@ -1307,7 +1313,58 @@ async def _generate_pseudo_stream_audio(
             f"OmniVoice returned PCM at an unsupported {sample_rate} Hz."
         )
 
-    return _encode_generated_audio(generated_audios[0], sample_rate, "pcm")
+    encoding_started_at = perf_counter()
+    audio_bytes = _encode_generated_audio(generated_audios[0], sample_rate, "pcm")
+    completed_at = perf_counter()
+    timing = calculate_speaker_tts_timing(
+        total_started_at=total_start,
+        lock_requested_at=lock_requested_at,
+        lock_acquired_at=lock_acquired_at,
+        inference_finished_at=inference_finished_at,
+        encoding_started_at=encoding_started_at,
+        completed_at=completed_at,
+        output_bytes=len(audio_bytes),
+        sample_rate=sample_rate,
+    )
+    if diagnostic_context is not None:
+        cuda_allocated_mib = (
+            torch.cuda.memory_allocated() / (1024 * 1024)
+            if torch.cuda.is_available()
+            else 0.0
+        )
+        cuda_reserved_mib = (
+            torch.cuda.memory_reserved() / (1024 * 1024)
+            if torch.cuda.is_available()
+            else 0.0
+        )
+        timing_arguments = (
+            diagnostic_context.get("session_id"),
+            diagnostic_context.get("turn_id"),
+            diagnostic_context.get("turn_revision"),
+            diagnostic_context.get("response_generation"),
+            diagnostic_context.get("segment_id"),
+            len(text),
+            request.num_step,
+            request.speed,
+            timing.lock_wait_seconds,
+            timing.inference_seconds,
+            timing.encoding_seconds,
+            timing.total_seconds,
+            timing.audio_seconds,
+            timing.real_time_factor,
+            cuda_allocated_mib,
+            cuda_reserved_mib,
+        )
+        logger.debug(
+            "Speaker TTS diagnostics: session=%s turn=%s revision=%s generation=%s segment=%s chars=%s steps=%s speed=%.3f lock_wait=%.3fs inference=%.3fs encoding=%.3fs total=%.3fs audio=%.3fs rtf=%.3f cuda_allocated_mib=%.1f cuda_reserved_mib=%.1f",
+            *timing_arguments,
+        )
+        if timing.total_seconds > 5 or timing.real_time_factor > 1:
+            logger.warning(
+                "Speaker TTS slow synthesis: session=%s turn=%s revision=%s generation=%s segment=%s chars=%s steps=%s speed=%.3f lock_wait=%.3fs inference=%.3fs encoding=%.3fs total=%.3fs audio=%.3fs rtf=%.3f cuda_allocated_mib=%.1f cuda_reserved_mib=%.1f",
+                *timing_arguments,
+            )
+    return audio_bytes
 
 
 def _encode_generated_audio(
@@ -2046,11 +2103,19 @@ async def _stream_speaker_text(
 async def _synthesize_speaker_sentence(
     context: SpeakerApplicationContext,
     sentence: str,
+    metadata: Any,
 ) -> bytes:
     return await _generate_pseudo_stream_audio(
         sentence,
         context.tts_request,
         context.voice_clone_prompt,
+        {
+            "response_generation": metadata.response_generation,
+            "segment_id": metadata.segment_id,
+            "session_id": metadata.session_id,
+            "turn_id": metadata.turn_id,
+            "turn_revision": metadata.turn_revision,
+        },
     )
 
 

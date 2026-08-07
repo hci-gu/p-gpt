@@ -117,17 +117,32 @@ class VadDiagnosticEvent(ClientEvent):
     type: Literal["client.vad_diagnostic"]
     activity: Literal[
         "audio_context",
+        "capture_recovery_completed",
+        "capture_recovery_exhausted",
+        "capture_recovery_started",
         "capture_started",
         "capture_stalled",
         "capture_stopped",
         "inference_timeout",
         "microphone_ended",
         "probability_summary",
+        "stale_event",
+        "vad_config",
+        "vad_state",
+        "worker_summary",
         "worker_error",
         "worker_ready",
     ]
     phase: Literal["idle", "capturing", "grace", "responding"]
     detail: str | None = Field(default=None, max_length=256)
+    capture_epoch: int | None = Field(default=None, ge=0)
+    detection_profile: Literal["start", "barge-in"] | None = None
+    pending_frame_count: int | None = Field(default=None, ge=0, le=10_000)
+    processing_average_milliseconds: float | None = Field(default=None, ge=0, le=60_000)
+    processing_maximum_milliseconds: float | None = Field(default=None, ge=0, le=60_000)
+    queue_delay_average_milliseconds: float | None = Field(default=None, ge=0, le=60_000)
+    queue_delay_maximum_milliseconds: float | None = Field(default=None, ge=0, le=60_000)
+    recovery_count: int | None = Field(default=None, ge=0, le=100)
     sample_count: int | None = Field(default=None, ge=0, le=10_000)
     probability_min: float | None = Field(default=None, ge=0, le=1)
     probability_average: float | None = Field(default=None, ge=0, le=1)
