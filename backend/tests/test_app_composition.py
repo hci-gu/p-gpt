@@ -17,6 +17,8 @@ class ApplicationCompositionTests(unittest.TestCase):
         }
         expected = {
             ("/ollama/models", "GET"),
+            ("/chat-history/{chat_history_id}/evaluate", "POST"),
+            ("/evaluation-config", "GET"),
             ("/persona-preparations", "POST"),
             ("/persona-preparations/{preparation_id}", "GET"),
             ("/initiate-request", "POST"),

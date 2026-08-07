@@ -5,6 +5,8 @@ import { create } from 'zustand'
 import { getApiErrorMessage } from '@/lib/api-error'
 import {
   createChatHistory,
+  type ChatEvaluation,
+  type ChatHistoryStatus,
   type StoredChatMessage,
   updateChatHistory,
 } from '@/lib/chat-history'
@@ -247,6 +249,9 @@ interface ChatState {
   messages: MessageType[]
   streamingMessageId: string | null
   activeHistoryId: string | null
+  activeHistoryStatus: ChatHistoryStatus
+  activeEvaluation: ChatEvaluation | null
+  activeCompletedAt: string | null
   activeChatKey: string
   activePersonaId: string | null
   setText: (text: string) => void
@@ -274,8 +279,13 @@ interface ChatState {
   loadChat: (
     recordId: string,
     conversation: StoredChatMessage[],
-    personaId: string | null
+    personaId: string | null,
+    historyStatus?: ChatHistoryStatus,
+    evaluation?: ChatEvaluation | null,
+    completedAt?: string | null
   ) => void
+  completeHistory: (evaluation: ChatEvaluation, completedAt: string) => void
+  setActiveHistoryStatus: (status: ChatHistoryStatus) => void
   selectPersonaForNewChat: (personaId: string) => void
   addUserMessage: (content: string) => void
   commitSpeakerUserMessage: (content: string) => void
@@ -298,6 +308,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
   messages: initialMessages,
   streamingMessageId: null,
   activeHistoryId: null,
+  activeHistoryStatus: 'active',
+  activeEvaluation: null,
+  activeCompletedAt: null,
   activeChatKey: createMessageId('chat'),
   activePersonaId: usePersonasStore.getState().selectedPersonaId,
   setText: (text) => {
@@ -600,7 +613,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
       return
     }
 
-    const { activeChatKey, activeHistoryId } = get()
+    const { activeChatKey, activeHistoryId, activeHistoryStatus } = get()
+    if (activeHistoryStatus !== 'active') {
+      return
+    }
     const previousSave = chatSaveChains.get(activeChatKey)
     let nextSave: Promise<string>
 
@@ -654,6 +670,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
     set({
       activeChatKey: createMessageId('chat'),
       activeHistoryId: null,
+      activeHistoryStatus: 'active',
+      activeEvaluation: null,
+      activeCompletedAt: null,
       activePersonaId: null,
       activeRequestAbortController: null,
       activeRequestId: null,
@@ -671,6 +690,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
     set({
       activeChatKey: createMessageId('chat'),
       activeHistoryId: null,
+      activeHistoryStatus: 'active',
+      activeEvaluation: null,
+      activeCompletedAt: null,
       activePersonaId: usePersonasStore.getState().selectedPersonaId,
       activeRequestAbortController: null,
       activeRequestId: null,
@@ -698,6 +720,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
     set({
       activeChatKey: createMessageId('chat'),
       activeHistoryId: null,
+      activeHistoryStatus: 'active',
+      activeEvaluation: null,
+      activeCompletedAt: null,
       activePersonaId: usePersonasStore.getState().selectedPersonaId,
       activeRequestAbortController: null,
       activeRequestId: null,
@@ -717,7 +742,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
       })
     }
   },
-  loadChat: (recordId, conversation, personaId) => {
+  loadChat: (
+    recordId,
+    conversation,
+    personaId,
+    historyStatus = 'active',
+    evaluation = null,
+    completedAt = null
+  ) => {
     void get().interruptAssistantResponse()
     const restoredPersonaId =
       personaId ?? usePersonasStore.getState().selectedPersonaId
@@ -729,6 +761,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
     set({
       activeChatKey: `history-${recordId}`,
       activeHistoryId: recordId,
+      activeHistoryStatus: historyStatus,
+      activeEvaluation: evaluation,
+      activeCompletedAt: completedAt,
       activePersonaId: restoredPersonaId,
       activeRequestAbortController: null,
       activeRequestId: null,
@@ -740,6 +775,16 @@ export const useChatStore = create<ChatState>((set, get) => ({
       transcriptionDraft: null,
     })
   },
+  completeHistory: (evaluation, completedAt) => {
+    set({
+      activeHistoryStatus: 'completed',
+      activeEvaluation: evaluation,
+      activeCompletedAt: completedAt,
+    })
+  },
+  setActiveHistoryStatus: (activeHistoryStatus) => {
+    set({ activeHistoryStatus })
+  },
   selectPersonaForNewChat: (personaId) => {
     set((state) =>
       state.messages.length === 0 && !state.activeHistoryId
@@ -748,6 +793,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
     )
   },
   addUserMessage: (content) => {
+    if (get().activeHistoryStatus !== 'active') {
+      return
+    }
     const userMessageId = createMessageId('user')
     const userMessage: MessageType = {
       from: 'user',
@@ -784,6 +832,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
     void get().fetchAssistantResponse(assistantMessageId, history)
   },
   commitSpeakerUserMessage: (content) => {
+    if (get().activeHistoryStatus !== 'active') {
+      return
+    }
     const cleanContent = content.trim()
     if (!cleanContent) {
       return
@@ -805,6 +856,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
     get().persistConversation(toChatHistory(get().messages))
   },
   commitSpeakerAssistantMessage: (content, finishReason) => {
+    if (get().activeHistoryStatus !== 'active') {
+      return
+    }
     const cleanContent = content.trim()
     if (!cleanContent) {
       return
@@ -828,6 +882,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
   getConversationHistory: () => toChatHistory(get().messages),
   submitMessage: (content) => {
+    if (get().activeHistoryStatus !== 'active') {
+      return
+    }
     set({ status: 'submitted', text: '' })
     get().addUserMessage(content)
   },

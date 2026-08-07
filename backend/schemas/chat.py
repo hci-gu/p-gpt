@@ -98,3 +98,7 @@ class InitiateRequest(BaseModel):
     @classmethod
     def clamp_num_step(cls, value: int) -> int:
         return min(32, max(22, value))
+
+
+class EvaluateChatHistoryRequest(BaseModel):
+    ollama_model: str = Field(min_length=1, max_length=256)

@@ -5,6 +5,12 @@ import {
   listChatHistories,
   renameChatHistory,
 } from '@/lib/chat-history'
+import {
+  evaluateChatHistory,
+  canEvaluateChatHistory,
+  getEvaluationConfig,
+} from '@/lib/conversation-evaluation'
+import { EvaluationDialog } from '@/components/evaluation-dialog'
 import { useChatStore } from '@/src/state/chat'
 import { useAuthStore } from '@/src/state/auth'
 import { Button } from '@/components/ui/button'
@@ -40,6 +46,7 @@ import { usePreferencesStore } from '@/src/state/preferences'
 import {
   CheckIcon,
   BrainIcon,
+  ClipboardCheckIcon,
   ChevronUpIcon,
   ImageIcon,
   LogOutIcon,
@@ -75,6 +82,11 @@ const getChatTimestamp = (record: ChatHistoryRecord) => {
 export function AppSidebar(props: ComponentProps<typeof Sidebar>) {
   const { open, setOpen } = useSidebar()
   const activeHistoryId = useChatStore((state) => state.activeHistoryId)
+  const chatStatus = useChatStore((state) => state.status)
+  const completeHistory = useChatStore((state) => state.completeHistory)
+  const setActiveHistoryStatus = useChatStore(
+    (state) => state.setActiveHistoryStatus
+  )
   const loadChat = useChatStore((state) => state.loadChat)
   const startNewChat = useChatStore((state) => state.startNewChat)
   const clearDeletedChat = useChatStore((state) => state.clearDeletedChat)
@@ -82,6 +94,9 @@ export function AppSidebar(props: ComponentProps<typeof Sidebar>) {
   const user = useAuthStore((state) => state.user)
   const selectedBackgroundId = usePreferencesStore(
     (state) => state.selectedBackgroundId
+  )
+  const selectedModel = usePreferencesStore(
+    (state) => state.generationParameters.model
   )
   const selectBackground = usePreferencesStore(
     (state) => state.selectBackground
@@ -100,6 +115,22 @@ export function AppSidebar(props: ComponentProps<typeof Sidebar>) {
   const [isBackgroundDialogOpen, setIsBackgroundDialogOpen] = useState(false)
   const [isPersonaDialogOpen, setIsPersonaDialogOpen] = useState(false)
   const [isParametersDialogOpen, setIsParametersDialogOpen] = useState(false)
+  const [isCloudEvaluation, setIsCloudEvaluation] = useState(false)
+  const [evaluationDialog, setEvaluationDialog] = useState<{
+    error: string | null
+    evaluation: ChatHistoryRecord['evaluation']
+    message: string
+    open: boolean
+    phase: 'progress' | 'results' | 'error'
+    progress: number
+  }>({
+    error: null,
+    evaluation: null,
+    message: 'Preparing evaluation',
+    open: false,
+    phase: 'progress',
+    progress: 0,
+  })
 
   const loadChatHistories = useCallback(async (signal?: AbortSignal) => {
     try {
@@ -186,10 +217,111 @@ export function AppSidebar(props: ComponentProps<typeof Sidebar>) {
     [renameDraft]
   )
 
+  const handleEvaluateChat = useCallback(
+    (record: ChatHistoryRecord) => {
+      if (!selectedModel) {
+        setEvaluationDialog({
+          error: 'Select an Ollama model before evaluating this conversation.',
+          evaluation: null,
+          message: '',
+          open: true,
+          phase: 'error',
+          progress: 0,
+        })
+        return
+      }
+
+      setChatHistories((records) =>
+        records.map((current) =>
+          current.id === record.id ? { ...current, status: 'evaluating' } : current
+        )
+      )
+      if (activeHistoryId === record.id) {
+        setActiveHistoryStatus('evaluating')
+      }
+      setEvaluationDialog({
+        error: null,
+        evaluation: null,
+        message: 'Starting evaluation',
+        open: true,
+        phase: 'progress',
+        progress: 0,
+      })
+      void evaluateChatHistory(record.id, selectedModel, {
+        onError: (message) => {
+          setChatHistories((records) =>
+            records.map((current) =>
+              current.id === record.id ? { ...current, status: 'active' } : current
+            )
+          )
+          if (activeHistoryId === record.id) {
+            setActiveHistoryStatus('active')
+          }
+          setEvaluationDialog((current) => ({
+            ...current,
+            error: message,
+            phase: 'error',
+          }))
+        },
+        onProgress: (progress, message) => {
+          setEvaluationDialog((current) => ({ ...current, message, progress }))
+        },
+        onResult: (evaluation, completedAt) => {
+          setChatHistories((records) =>
+            records.map((current) =>
+              current.id === record.id
+                ? {
+                    ...current,
+                    completedAt,
+                    evaluation,
+                    status: 'completed',
+                  }
+                : current
+            )
+          )
+          if (activeHistoryId === record.id) {
+            completeHistory(evaluation, completedAt)
+          }
+          setEvaluationDialog((current) => ({
+            ...current,
+            evaluation,
+            phase: 'results',
+            progress: 100,
+          }))
+          window.dispatchEvent(new Event(CHAT_HISTORY_UPDATED_EVENT))
+        },
+      }).catch((error: unknown) => {
+        setChatHistories((records) =>
+          records.map((current) =>
+            current.id === record.id ? { ...current, status: 'active' } : current
+          )
+        )
+        if (activeHistoryId === record.id) {
+          setActiveHistoryStatus('active')
+        }
+        setEvaluationDialog((current) => ({
+          ...current,
+          error:
+            error instanceof Error ? error.message : 'Evaluation failed. Please try again.',
+          phase: 'error',
+        }))
+      })
+    },
+    [activeHistoryId, completeHistory, selectedModel, setActiveHistoryStatus]
+  )
+
+  const activeChatHistories = useMemo(
+    () => chatHistories.filter((record) => record.status !== 'completed'),
+    [chatHistories]
+  )
+  const completedChatHistories = useMemo(
+    () => chatHistories.filter((record) => record.status === 'completed'),
+    [chatHistories]
+  )
   const visibleChatHistories = useMemo(
     () =>
-      isHistoryExpanded ? chatHistories : chatHistories.slice(0, 5),
-    [chatHistories, isHistoryExpanded]
+      isHistoryExpanded ? activeChatHistories : activeChatHistories.slice(0, 5),
+    [activeChatHistories, isHistoryExpanded]
   )
 
   useEffect(() => {
@@ -209,6 +341,12 @@ export function AppSidebar(props: ComponentProps<typeof Sidebar>) {
       )
     }
   }, [loadChatHistories])
+
+  useEffect(() => {
+    void getEvaluationConfig().then(({ cloudEvaluation }) => {
+      setIsCloudEvaluation(cloudEvaluation)
+    })
+  }, [])
 
   return (
     <Sidebar collapsible="icon" {...props}>
@@ -337,7 +475,10 @@ export function AppSidebar(props: ComponentProps<typeof Sidebar>) {
                             loadChat(
                               record.id,
                               record.conversation,
-                              record.personaId
+                              record.personaId,
+                              record.status,
+                              record.evaluation,
+                              record.completedAt
                             )
                           }
                           tooltip={record.title}
@@ -358,6 +499,20 @@ export function AppSidebar(props: ComponentProps<typeof Sidebar>) {
                             : 'group-focus-within/menu-item:opacity-100 group-hover/menu-item:opacity-100 md:opacity-0'
                         }`}
                       >
+                        {canEvaluateChatHistory(record, activeHistoryId, chatStatus) && (
+                            <button
+                              aria-label={`Evaluate ${record.title}`}
+                              className="flex size-5 items-center justify-center rounded-[calc(var(--radius-sm)-2px)] text-sidebar-foreground outline-none hover:bg-sidebar-accent focus-visible:ring-2 focus-visible:ring-sidebar-ring [&>svg]:size-4"
+                              onClick={(event) => {
+                                event.stopPropagation()
+                                handleEvaluateChat(record)
+                              }}
+                              title="Finish and evaluate chat"
+                              type="button"
+                            >
+                              <ClipboardCheckIcon />
+                            </button>
+                          )}
                         <button
                           aria-label={`Rename ${record.title}`}
                           className={`flex size-5 items-center justify-center rounded-[calc(var(--radius-sm)-2px)] outline-none hover:bg-sidebar-accent focus-visible:ring-2 focus-visible:ring-sidebar-ring [&>svg]:size-4 ${
@@ -402,7 +557,7 @@ export function AppSidebar(props: ComponentProps<typeof Sidebar>) {
                 })}
               </SidebarMenu>
             </div>
-            {!isLoading && !loadError && chatHistories.length > 5 && (
+            {!isLoading && !loadError && activeChatHistories.length > 5 && (
               <button
                 className="mt-1 px-2 text-left text-xs text-sidebar-foreground/65 hover:text-sidebar-foreground hover:underline group-data-[collapsible=icon]:hidden"
                 onClick={() => setIsHistoryExpanded((expanded) => !expanded)}
@@ -413,6 +568,43 @@ export function AppSidebar(props: ComponentProps<typeof Sidebar>) {
             )}
           </SidebarGroupContent>
         </SidebarGroup>
+        {!isLoading && !loadError && completedChatHistories.length > 0 && (
+          <SidebarGroup>
+            <SidebarGroupLabel>Completed chats</SidebarGroupLabel>
+            <SidebarGroupContent>
+              <SidebarMenu>
+                {completedChatHistories.map((record) => (
+                  <SidebarMenuItem key={record.id}>
+                    <SidebarMenuButton
+                      aria-current={activeHistoryId === record.id ? 'page' : undefined}
+                      className="h-auto min-h-10 items-start"
+                      isActive={activeHistoryId === record.id}
+                      onClick={() =>
+                        loadChat(
+                          record.id,
+                          record.conversation,
+                          record.personaId,
+                          record.status,
+                          record.evaluation,
+                          record.completedAt
+                        )
+                      }
+                      tooltip={record.title}
+                    >
+                      <ClipboardCheckIcon className="mt-0.5" />
+                      <span className="grid min-w-0 flex-1 leading-tight">
+                        <span className="truncate">{record.title}</span>
+                        <span className="mt-0.5 text-[10px] text-sidebar-foreground/55">
+                          {getChatTimestamp(record)}
+                        </span>
+                      </span>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
+                ))}
+              </SidebarMenu>
+            </SidebarGroupContent>
+          </SidebarGroup>
+        )}
       </SidebarContent>
       <SidebarFooter className="border-t border-sidebar-border">
         <SidebarMenu>
@@ -543,6 +735,20 @@ export function AppSidebar(props: ComponentProps<typeof Sidebar>) {
       <ParametersDialog
         onOpenChange={setIsParametersDialogOpen}
         open={isParametersDialogOpen}
+      />
+      <EvaluationDialog
+        cloudEvaluation={isCloudEvaluation}
+        error={evaluationDialog.error}
+        evaluation={evaluationDialog.evaluation}
+        message={evaluationDialog.message}
+        onOpenChange={(open) => {
+          if (evaluationDialog.phase !== 'progress' || open) {
+            setEvaluationDialog((current) => ({ ...current, open }))
+          }
+        }}
+        open={evaluationDialog.open}
+        phase={evaluationDialog.phase}
+        progress={evaluationDialog.progress}
       />
     </Sidebar>
   )

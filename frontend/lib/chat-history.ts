@@ -4,11 +4,41 @@ export type StoredChatMessage = {
   finishReason?: 'interrupted'
 }
 
+export type ChatHistoryStatus = 'active' | 'evaluating' | 'completed'
+
+export type EvaluationMetric = {
+  score: number
+  rationale: string
+  improvement_suggestion: string
+}
+
+export type ChatEvaluation = {
+  schema_version: number
+  judge_model: string
+  provider: string
+  evaluated_at: string
+  practitioner_empathy: EvaluationMetric
+  practitioner_professionalism: EvaluationMetric
+  practitioner_relevance: EvaluationMetric
+  mock_patient_frustration: {
+    level: 'low' | 'moderate' | 'high'
+    rationale: string
+  }
+  overall_feedback: {
+    summary: string
+    strengths: string
+    priorities: string
+  }
+}
+
 export type ChatHistoryRecord = {
   id: string
   title: string
   personaId: string | null
   conversation: StoredChatMessage[]
+  status: ChatHistoryStatus
+  completedAt: string | null
+  evaluation: ChatEvaluation | null
   created: string
   updated: string
 }
@@ -24,6 +54,23 @@ export const createChatTitle = (conversation: StoredChatMessage[]) => {
 
 const isStoredRole = (role: unknown): role is StoredChatMessage['role'] =>
   role === 'user' || role === 'assistant' || role === 'system'
+
+const isChatHistoryStatus = (value: unknown): value is ChatHistoryStatus =>
+  value === 'active' || value === 'evaluating' || value === 'completed'
+
+const parseEvaluation = (value: unknown): ChatEvaluation | null => {
+  if (typeof value !== 'object' || value === null) {
+    return null
+  }
+
+  const evaluation = value as Partial<ChatEvaluation>
+  return typeof evaluation.schema_version === 'number' &&
+    typeof evaluation.judge_model === 'string' &&
+    typeof evaluation.provider === 'string' &&
+    typeof evaluation.evaluated_at === 'string'
+    ? (evaluation as ChatEvaluation)
+    : null
+}
 
 const parseConversation = (value: unknown): StoredChatMessage[] => {
   const messages =
@@ -83,6 +130,15 @@ const parseRecord = (value: unknown): ChatHistoryRecord | null => {
     conversation: parseConversation(
       'conversation' in value ? value.conversation : []
     ),
+    status:
+      'status' in value && isChatHistoryStatus(value.status)
+        ? value.status
+        : 'active',
+    completedAt:
+      'completed_at' in value && typeof value.completed_at === 'string'
+        ? value.completed_at
+        : null,
+    evaluation: parseEvaluation('evaluation' in value ? value.evaluation : null),
     created:
       'created' in value && typeof value.created === 'string'
         ? value.created
@@ -118,6 +174,7 @@ export const createChatHistory = async (
   const response = await pb.collection('chat_history').create({
     conversation,
     persona_id: personaId ?? '',
+    status: 'active',
     title: createChatTitle(conversation),
   })
   const record = parseRecord(response)

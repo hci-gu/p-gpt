@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     )
     mlflow_prompt_name: str = "pgpt-prompt"
     mlflow_prompt_version: int | str = "latest"
+    evaluation_model: str | None = None
     n_retries: int = Field(default=3, ge=1)
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     log_path: str = str(Path(__file__).with_name("logs") / "p-gpt.log")

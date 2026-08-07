@@ -40,6 +40,7 @@ import { SpeechInput } from '@/components/ai-elements/speech-input'
 import type { TranscriptionEvent } from '@/components/ai-elements/speech-input'
 import { Suggestions } from '@/components/ai-elements/suggestion'
 import { SpeechLanguageToggle } from '@/components/speech-language-toggle'
+import { EvaluationResults } from '@/components/evaluation-dialog'
 import { Spinner } from '@/components/ui/spinner'
 import { Slider } from '@/components/ui/slider'
 import { Switch } from '@/components/ui/switch'
@@ -207,6 +208,8 @@ const ChatPage = () => {
   const status = useChatStore((state) => state.status)
   const messages = useChatStore((state) => state.messages)
   const activePersonaId = useChatStore((state) => state.activePersonaId)
+  const activeHistoryStatus = useChatStore((state) => state.activeHistoryStatus)
+  const activeEvaluation = useChatStore((state) => state.activeEvaluation)
   const personas = usePersonasStore((state) => state.personas)
   const selectedPersonaId = usePersonasStore(
     (state) => state.selectedPersonaId
@@ -246,11 +249,13 @@ const ChatPage = () => {
     useState<string | null>(null)
   const transcriptionAnimationRef = useRef<number | null>(null)
   const isGenerating = status === 'submitted' || status === 'streaming'
+  const isCompleted = activeHistoryStatus === 'completed'
+  const isLocked = activeHistoryStatus !== 'active'
   const activePersona = personas.find(
     (persona) => persona.id === (activePersonaId ?? selectedPersonaId)
   )
   const speakerSession = useSpeakerSession({
-    enabled: isVoiceOnlyMode,
+    enabled: isVoiceOnlyMode && !isLocked,
     persona: activePersona,
     volume: ttsVolume,
   })
@@ -526,7 +531,13 @@ const ChatPage = () => {
         </ConversationContent>
         <ConversationScrollButton />
       </Conversation>
-      {isVoiceOnlyMode && (
+      {isCompleted && activeEvaluation && (
+        <section className="mx-4 mt-4 max-h-[42vh] overflow-y-auto rounded-xl border bg-background/85 p-4 shadow-sm">
+          <h2 className="mb-3 font-semibold text-sm">Evaluation results</h2>
+          <EvaluationResults evaluation={activeEvaluation} />
+        </section>
+      )}
+      {isVoiceOnlyMode && !isLocked && (
         <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-6 p-6">
           <div className="relative flex size-[22rem] items-center justify-center sm:size-[28rem]">
             <div
@@ -577,7 +588,8 @@ const ChatPage = () => {
           </div>
         </div>
       )}
-      <div className="grid shrink-0 gap-4 pt-4">
+      {!isLocked && (
+        <div className="grid shrink-0 gap-4 pt-4">
         {shouldShowSuggestions && (
           <Suggestions className="px-4">
             {suggestions.map((suggestion) => (
@@ -674,7 +686,8 @@ const ChatPage = () => {
             </PromptInput>
           </div>
         )}
-      </div>
+        </div>
+      )}
     </div>
   )
 }

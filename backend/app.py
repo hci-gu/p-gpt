@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from config import settings
 from logging_config import configure_persistent_logging
+from routers.evaluations import router as evaluations_router
 from routers.models import router as models_router
 from routers.personas import router as personas_router
 from routers.pseudo_stream import router as pseudo_stream_router
@@ -38,6 +39,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(models_router)
+app.include_router(evaluations_router)
 app.include_router(personas_router)
 app.include_router(requests_router)
 app.include_router(pseudo_stream_router)
